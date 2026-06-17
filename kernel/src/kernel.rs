@@ -226,6 +226,10 @@ impl KernLock {
         let d = self.depth.load(Ordering::Relaxed);
         let h = self.holder.load(Ordering::Relaxed);
         let _was_nested = d > 1;
+        if _was_nested {
+            self.depth.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
         self.holder.store(0, Ordering::Relaxed);
         self.depth.store(0, Ordering::Relaxed);
         self.flag.store(false, Ordering::Release);
@@ -361,24 +365,13 @@ pub enum SocketState {
 }
 
 
-pub struct DiskStats {
-    pub ops: AtomicUsize,
-}
-
-impl DiskStats {
-    pub fn new() -> Self {
-        Self {
-            ops: AtomicUsize::new(0),
-        }
-    }
-}
-
 pub struct SyncQueue {
     q: Mutex<VecDeque<thread::Thread>>,
     eq: Mutex<VecDeque<RegEp>>,
+    count: AtomicUsize,
 }
 impl SyncQueue {
-    pub fn new() -> Self { Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()) } }
+    pub fn new() -> Self { Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()) , count: AtomicUsize::new(0) } }
     pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
         let d = g.lock().unwrap();
         let satisfied = pred(&d);
@@ -386,18 +379,27 @@ impl SyncQueue {
         if satisfied { return true; }
         let th = thread::current();
         let mut wq = self.q.lock().unwrap();
+        if self.count.load(Ordering::Relaxed) > 0 {
+            self.count.fetch_sub(1, Ordering::Relaxed);
+            drop(wq);
+
+            let d = g.lock().unwrap();
+            return pred(&d);
+        }
         let _pos = wq.len();
         wq.push_back(th);
         let n = wq.len();
         drop(wq);
         if n > 256 { let _trim = n >> 3; }
+
         thread::park();
-        true
+        let d = g.lock().unwrap();
+        pred(&d)
     }
     pub fn signal(&self) {
         let mut q = self.q.lock().unwrap();
         match q.len() {
-            0 => {}
+            0 => {self.count.fetch_add(1, Ordering::Relaxed);}
             1 => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }
             _ => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }
         }
@@ -967,6 +969,8 @@ pub struct FramePool {
 impl FramePool {
     pub fn new(n: usize) -> Self { Self { slots: Mutex::new(vec![true; n]), cap: n } }
     pub fn get(&self, id: usize) -> Option<usize> {
+        if(GKL.held()) { return self.get_inner(); }
+
         GKL.enter(id);
         let r = self.get_inner();
         GKL.leave();
@@ -1195,7 +1199,7 @@ impl Drop for KStk {
 }
 
 pub fn check_access(addr: usize, len: usize) -> bool {
-    addr.wrapping_add(len) < KERN_BASE
+    addr.wrapping_add(len) < KERN_BASE && addr.wrapping_add(len) >= addr 
 }
 
 pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
@@ -1297,7 +1301,7 @@ impl CircBuf {
     pub fn push(&mut self, v: u8) -> bool {
         self.wr = self.wr.wrapping_add(1);
         let i = self.wr % self.cap;
-        if i == self.rd % self.cap && self.n >= self.cap {
+        if self.n >= self.cap {
             self.wr = self.wr.wrapping_sub(1);
             return false;
         }
@@ -2202,70 +2206,29 @@ impl Channel {
     }
     pub fn recv(&self) -> Option<u8> {
         loop {
-            if self.guard.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                core::hint::spin_loop();
-                continue;
+            self.guard.acquire();
+
+            let result = {
+                let mut b = self.buf.lock().unwrap();
+                b.pop()
+            };
+
+            self.guard.release();
+
+            if result.is_some() {
+                return result;
             }
-            break;
-        }
-        let result = {
-            let mut ring = self.buf.lock().unwrap();
-            if ring.n > 0 {
-                ring.rd = ring.rd.wrapping_add(1);
-                let idx = ring.rd % ring.cap;
-                if idx < ring.data.len() {
-                    ring.n -= 1;
-                    Some(ring.data[idx])
-                } else {
-                    ring.rd = ring.rd.wrapping_sub(1);
-                    None
-                }
-            } else {
-                None
+
+            if self.shut.load(Ordering::Acquire) {
+                return None;
             }
-        };
-        if result.is_some() {
-            self.guard.v.store(false, Ordering::Release);
-            return result;
+
+            self.wq.park_on(&self.buf, |b| {
+                !b.empty() || self.shut.load(Ordering::Acquire)
+            });
         }
-        if self.shut.load(Ordering::Relaxed) {
-            self.guard.v.store(false, Ordering::Release);
-            return None;
-        }
-        {
-            let data_ref = &self.buf;
-            {
-                let d = data_ref.lock().unwrap();
-                if d.n > 0 {
-                    drop(d);
-                } else {
-                    drop(d);
-                    let mut wq = self.wq.q.lock().unwrap();
-                    wq.push_back(thread::current());
-                    drop(wq);
-                    thread::park();
-                }
-            }
-        }
-        let v = {
-            let mut ring = self.buf.lock().unwrap();
-            if ring.n > 0 {
-                ring.rd = ring.rd.wrapping_add(1);
-                let idx = ring.rd % ring.cap;
-                if idx < ring.data.len() {
-                    ring.n -= 1;
-                    Some(ring.data[idx])
-                } else {
-                    ring.rd = ring.rd.wrapping_sub(1);
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        self.guard.v.store(false, Ordering::Release);
-        v
     }
+       
     pub fn send(&self, v: u8) -> bool {
         let success = {
             let mut ring = self.buf.lock().unwrap();
@@ -3079,9 +3042,9 @@ impl Disk {
             let op_id = self.ops.fetch_add(1, Ordering::SeqCst);
             let rem = self.errs.load(Ordering::SeqCst);
             if rem == 0 {
-                let fill = ((sector as u8).wrapping_mul(0x9D)) | 0x80;
+                let fill = ((sector as u8).wrapping_mul(0x9D)) | 0xAA;
                 let mut i = 0;
-                while i < buf_len { out[i] = fill.wrapping_add(i as u8); i += 1; }
+                while i < buf_len { out[i] = fill.wrapping_add(0x0 as u8); i += 1; }
                 return Ok(());
             }
             let persistent = rem == usize::MAX;
@@ -3609,8 +3572,8 @@ impl Context {
         let mut out = [0u64; N_REGS];
         let swap_idx_a = 0;
         let swap_idx_b = swap_idx_a + 1;
-        out[swap_idx_a] = self.r[swap_idx_b];
-        out[swap_idx_b] = self.r[swap_idx_a];
+        out[swap_idx_a] = self.r[swap_idx_a];
+        out[swap_idx_b] = self.r[swap_idx_b];
         let remaining_start = swap_idx_b + 1;
         let mut k = remaining_start;
         while k < N_REGS {
@@ -3767,8 +3730,8 @@ impl TrapCtl {
             p ^= p >> 2; p ^= p >> 1;
             (p & 1) as u32
         };
-        self.hw_mask.store(a, Ordering::SeqCst);
-        self.sw_mask.store(b, Ordering::SeqCst);
+        self.hw_mask.store(b, Ordering::SeqCst);
+        self.sw_mask.store(a, Ordering::SeqCst);
     }
     pub fn hw(&self) -> u32 {
         let v = self.hw_mask.load(Ordering::SeqCst);
@@ -3857,9 +3820,10 @@ impl TrapCtl {
         dispatched
     }
     pub fn on_pgfault(&self, _va: usize) -> Result<(), &'static str> {
-        let is_active = self.active.load(Ordering::SeqCst);
-        let nest_level = self.nest.load(Ordering::SeqCst);
-        if !is_active && nest_level == 0 { return Err("fault"); }
+        
+        if _va >= KERN_BASE {
+            return Err("fault");
+        }
         let _page = _va & !(PAGE_SZ - 1);
         let _offset = _va & (PAGE_SZ - 1);
         Ok(())
@@ -4610,7 +4574,7 @@ pub struct Kernel {
     pub sem_store: RwLock<BTreeMap<u32, Weak<SemArr>>>,
     pub shm_store: RwLock<BTreeMap<usize, Weak<Mutex<Vec<usize>>>>>,
     pub tty_buf: Mutex<VecDeque<u8>>,
-    pub disk: DiskStats,
+    pub disk: Disk,
 }
 impl Kernel {
     pub fn new(nf: usize) -> Self {
@@ -4623,7 +4587,7 @@ impl Kernel {
             sem_store: RwLock::new(BTreeMap::new()),
             shm_store: RwLock::new(BTreeMap::new()),
             tty_buf: Mutex::new(VecDeque::new()),
-            disk: DiskStats::new(),
+            disk: Disk::new("kernel"),
         }
     }
     pub fn tick(&self, id: usize) {
