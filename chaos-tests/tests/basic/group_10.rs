@@ -9,7 +9,6 @@ fn basic_access_ok_valid_range() {
 #[test]
 fn basic_access_ok_overflow() {
     let result = check_access(KERN_BASE - 1, usize::MAX);
-    
     assert!(!result);
 }
 
