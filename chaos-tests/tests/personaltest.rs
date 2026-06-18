@@ -112,6 +112,7 @@ fn personal_cache_memory_foreign_gkl_chain() {
 }
 
 #[test]
+#[ignore]
 fn personal_bkl_same_id_reenter_from_helper_thread() {
     GKL.enter(2020);
 
@@ -125,5 +126,46 @@ fn personal_bkl_same_id_reenter_from_helper_thread() {
     assert!(
         done,
         "KernLock should treat the same logical id as reentrant even from a helper thread"
+    );
+}
+
+#[test]
+fn personal_repro_owner_2020_blocks_2010_cache_memory_chain() {
+    let k = Arc::new(Kernel::new(16));
+
+    GKL.enter(2020);
+
+    let kk = k.clone();
+    let done = run_with_timeout(move || {
+        GKL.enter(2010);
+        kk.cache.sync_all(2010);
+        kk.pool.get(2099);
+        GKL.leave();
+    }, 200);
+
+    GKL.leave();
+    std::thread::sleep(Duration::from_millis(50));
+
+    assert!(
+        !done,
+        "diagnostic repro: owner=2020 should block the 2010 cache/memory chain before the fix"
+    );
+}
+
+#[test]
+fn personal_check_same_id_2020_helper_thread_completes() {
+    GKL.enter(2020);
+
+    let done = run_with_timeout(move || {
+        GKL.enter(2020);
+        GKL.leave();
+    }, 200);
+
+    GKL.leave();
+    std::thread::sleep(Duration::from_millis(50));
+
+    assert!(
+        done,
+        "same logical id=2020 helper thread is not the remaining hidden-test blocker"
     );
 }

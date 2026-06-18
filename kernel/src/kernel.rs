@@ -210,23 +210,30 @@ pub struct KernLock {
     flag: AtomicBool,
     holder: AtomicUsize,
     depth: AtomicUsize,
+    holder_line: AtomicUsize,
 }
 impl KernLock {
     pub const fn new() -> Self {
-        Self { flag: AtomicBool::new(false), holder: AtomicUsize::new(0), depth: AtomicUsize::new(0) }
+        Self {
+            flag: AtomicBool::new(false),
+            holder: AtomicUsize::new(0),
+            depth: AtomicUsize::new(0),
+            holder_line: AtomicUsize::new(0),
+        }
     }
     #[track_caller]
     pub fn enter(&self, id: usize) {
         let caller = std::panic::Location::caller();
         let local = GKL_LOCAL_DEPTH.with(|d| d.get());
         eprintln!(
-            "[DBG] enter KernLock::enter id={} caller={}:{} local={} held={} owner={} level={}",
+            "[DBG] enter KernLock::enter id={} caller={}:{} local={} held={} owner={} owner_line={} level={}",
             id,
             caller.file(),
             caller.line(),
             local,
             self.held(),
             self.owner(),
+            self.holder_line.load(Ordering::Relaxed),
             self.level()
         );
         if local > 0 {
@@ -246,15 +253,33 @@ impl KernLock {
         if id != 0 && self.holder.load(Ordering::Relaxed) == id {
             GKL_LOCAL_DEPTH.with(|d| d.set(1));
             self.depth.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "[DBG] KernLock::enter same-owner id={} caller={}:{} owner={} owner_line={} level={}",
+                id,
+                caller.file(),
+                caller.line(),
+                self.owner(),
+                self.holder_line.load(Ordering::Relaxed),
+                self.level()
+            );
             return;
         }
 
-        eprintln!("[DBG] KernLock::enter before spin id={} caller={}:{}", id, caller.file(), caller.line());
+        eprintln!(
+            "[DBG] KernLock::enter before spin id={} caller={}:{} owner={} owner_line={} level={}",
+            id,
+            caller.file(),
+            caller.line(),
+            self.owner(),
+            self.holder_line.load(Ordering::Relaxed),
+            self.level()
+        );
         while self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
         }
 
         self.holder.store(id, Ordering::Relaxed);
+        self.holder_line.store(caller.line() as usize, Ordering::Relaxed);
         self.depth.store(1, Ordering::Relaxed);
         GKL_LOCAL_DEPTH.with(|d| d.set(1));
         eprintln!(
@@ -271,12 +296,13 @@ impl KernLock {
         let caller = std::panic::Location::caller();
         let local = GKL_LOCAL_DEPTH.with(|d| d.get());
         eprintln!(
-            "[DBG] enter KernLock::leave caller={}:{} local={} held={} owner={} level={}",
+            "[DBG] enter KernLock::leave caller={}:{} local={} held={} owner={} owner_line={} level={}",
             caller.file(),
             caller.line(),
             local,
             self.held(),
             self.owner(),
+            self.holder_line.load(Ordering::Relaxed),
             self.level()
         );
 
@@ -312,6 +338,7 @@ impl KernLock {
         }
 
         self.holder.store(0, Ordering::Relaxed);
+        self.holder_line.store(0, Ordering::Relaxed);
         self.depth.store(0, Ordering::Relaxed);
         self.flag.store(false, Ordering::Release);
         eprintln!(
@@ -332,13 +359,14 @@ impl KernLock {
         let caller = std::panic::Location::caller();
         let local = GKL_LOCAL_DEPTH.with(|d| d.get());
         eprintln!(
-            "[DBG] enter KernLock::try_enter id={} caller={}:{} local={} held={} owner={} level={}",
+            "[DBG] enter KernLock::try_enter id={} caller={}:{} local={} held={} owner={} owner_line={} level={}",
             id,
             caller.file(),
             caller.line(),
             local,
             self.held(),
             self.owner(),
+            self.holder_line.load(Ordering::Relaxed),
             self.level()
         );
         if local > 0 {
@@ -359,11 +387,21 @@ impl KernLock {
         if id != 0 && self.holder.load(Ordering::Relaxed) == id {
             GKL_LOCAL_DEPTH.with(|d| d.set(1));
             self.depth.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "[DBG] KernLock::try_enter same-owner id={} caller={}:{} owner={} owner_line={} level={}",
+                id,
+                caller.file(),
+                caller.line(),
+                self.owner(),
+                self.holder_line.load(Ordering::Relaxed),
+                self.level()
+            );
             return true;
         }
 
         if self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
             self.holder.store(id, Ordering::Relaxed);
+            self.holder_line.store(caller.line() as usize, Ordering::Relaxed);
             self.depth.store(1, Ordering::Relaxed);
             GKL_LOCAL_DEPTH.with(|d| d.set(1));
             eprintln!(
