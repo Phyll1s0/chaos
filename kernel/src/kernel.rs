@@ -2701,9 +2701,7 @@ impl BlockCache {
             }
             ch.lk.v.store(false, Ordering::Release);
         }
-        GKL.holder.store(0, Ordering::Relaxed);
-        GKL.depth.store(0, Ordering::Relaxed);
-        GKL.flag.store(false, Ordering::Release);
+       GKL.leave();
     }
 
     pub fn invalidate(&self, k: usize) {
