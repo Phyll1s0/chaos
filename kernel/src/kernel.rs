@@ -1003,21 +1003,46 @@ impl FramePool {
     pub fn new(n: usize) -> Self { Self { slots: Mutex::new(vec![true; n]), cap: n } }
     pub fn get(&self, id: usize) -> Option<usize> {
         eprintln!("[DBG] enter FramePool::get id={}", id);
+        eprintln!(
+            "[DBG] FramePool::get state id={} gkl_held={} by_current={} owner={} level={}",
+            id,
+            GKL.held(),
+            GKL.held_by_current(),
+            GKL.owner(),
+            GKL.level()
+        );
         if GKL.held_by_current() {
+            eprintln!("[DBG] FramePool::get bypass GKL id={}", id);
             return self.get_inner();
         }
 
+        eprintln!("[DBG] FramePool::get before GKL.enter id={}", id);
         GKL.enter(id);
+        eprintln!(
+            "[DBG] FramePool::get after GKL.enter id={} owner={} level={}",
+            id,
+            GKL.owner(),
+            GKL.level()
+        );
         let r = self.get_inner();
+        eprintln!("[DBG] FramePool::get before GKL.leave id={}", id);
         GKL.leave();
+        eprintln!("[DBG] FramePool::get after GKL.leave id={}", id);
         r
     }
     pub fn get_inner(&self) -> Option<usize> {
         eprintln!("[DBG] enter FramePool::get_inner");
+        eprintln!("[DBG] FramePool::get_inner before slots lock");
         let mut s = self.slots.lock().unwrap();
+        eprintln!("[DBG] FramePool::get_inner got slots lock");
         for (i, f) in s.iter_mut().enumerate() {
-            if *f { *f = false; return Some(i); }
+            if *f {
+                *f = false;
+                eprintln!("[DBG] FramePool::get_inner alloc idx={}", i);
+                return Some(i);
+            }
         }
+        eprintln!("[DBG] FramePool::get_inner no free frame");
         None
     }
     pub fn get_contig(&self, sz: usize, align_log2: usize) -> Option<usize> {
@@ -2727,9 +2752,26 @@ impl BlockCache {
     }
     pub fn sync_all(&self, id: usize) {
         eprintln!("[DBG] enter BlockCache::sync_all id={}", id);
+        eprintln!(
+            "[DBG] BlockCache::sync_all before try_enter id={} held={} by_current={} owner={} level={}",
+            id,
+            GKL.held(),
+            GKL.held_by_current(),
+            GKL.owner(),
+            GKL.level()
+        );
         if !GKL.try_enter(id) {
+            eprintln!("[DBG] BlockCache::sync_all try_enter failed id={}", id);
             return;
         }
+        eprintln!(
+            "[DBG] BlockCache::sync_all after try_enter id={} held={} by_current={} owner={} level={}",
+            id,
+            GKL.held(),
+            GKL.held_by_current(),
+            GKL.owner(),
+            GKL.level()
+        );
         let mut synced = 0usize;
         for chain_idx in 0..self.chains.len() {
             let ch = &self.chains[chain_idx];
@@ -2745,7 +2787,16 @@ impl BlockCache {
             }
             ch.lk.release();
         }
-       GKL.leave();
+        eprintln!("[DBG] BlockCache::sync_all before GKL.leave id={}", id);
+        GKL.leave();
+        eprintln!(
+            "[DBG] BlockCache::sync_all after GKL.leave id={} held={} by_current={} owner={} level={}",
+            id,
+            GKL.held(),
+            GKL.held_by_current(),
+            GKL.owner(),
+            GKL.level()
+        );
     }
 
     pub fn invalidate(&self, k: usize) {
