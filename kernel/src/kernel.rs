@@ -243,6 +243,11 @@ impl KernLock {
             );
             return;
         }
+        if id != 0 && self.holder.load(Ordering::Relaxed) == id {
+            GKL_LOCAL_DEPTH.with(|d| d.set(1));
+            self.depth.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
 
         eprintln!("[DBG] KernLock::enter before spin id={} caller={}:{}", id, caller.file(), caller.line());
         while self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
@@ -348,6 +353,12 @@ impl KernLock {
                 self.owner(),
                 self.level()
             );
+            return true;
+        }
+        
+        if id != 0 && self.holder.load(Ordering::Relaxed) == id {
+            GKL_LOCAL_DEPTH.with(|d| d.set(1));
+            self.depth.fetch_add(1, Ordering::Relaxed);
             return true;
         }
 

@@ -110,3 +110,20 @@ fn personal_cache_memory_foreign_gkl_chain() {
         "FramePool::get should not enter get_inner while another thread holds GKL"
     );
 }
+
+#[test]
+fn personal_bkl_same_id_reenter_from_helper_thread() {
+    GKL.enter(2020);
+
+    let done = run_with_timeout(move || {
+        GKL.enter(2020);
+        GKL.leave();
+    }, 200);
+
+    GKL.leave();
+
+    assert!(
+        done,
+        "KernLock should treat the same logical id as reentrant even from a helper thread"
+    );
+}
