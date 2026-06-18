@@ -211,6 +211,7 @@ pub struct KernLock {
     holder: AtomicUsize,
     depth: AtomicUsize,
     holder_line: AtomicUsize,
+    holder_tid: Mutex<Option<thread::ThreadId>>,
 }
 impl KernLock {
     pub const fn new() -> Self {
@@ -219,6 +220,15 @@ impl KernLock {
             holder: AtomicUsize::new(0),
             depth: AtomicUsize::new(0),
             holder_line: AtomicUsize::new(0),
+            holder_tid: Mutex::new(None),
+        }
+    }
+    fn holder_tid_dbg(&self) -> Option<thread::ThreadId> {
+        self.holder_tid.lock().map(|g| *g).unwrap_or(None)
+    }
+    fn set_holder_tid_dbg(&self, tid: Option<thread::ThreadId>) {
+        if let Ok(mut g) = self.holder_tid.lock() {
+            *g = tid;
         }
     }
     #[track_caller]
@@ -226,6 +236,17 @@ impl KernLock {
         let caller = std::panic::Location::caller();
         let local = GKL_LOCAL_DEPTH.with(|d| d.get());
         let tid = std::thread::current().id();
+        eprintln!(
+            "[DBG-HOLDER] enter current_tid={:?} id={} caller={}:{} owner={} owner_line={} holder_tid={:?} level={}",
+            tid,
+            id,
+            caller.file(),
+            caller.line(),
+            self.owner(),
+            self.holder_line.load(Ordering::Relaxed),
+            self.holder_tid_dbg(),
+            self.level()
+        );
         eprintln!(
             "[DBG-THREAD] enter tid={:?} id={} caller={}:{} local={} held={} owner={} owner_line={} level={}",
             tid,
@@ -253,6 +274,15 @@ impl KernLock {
             GKL_LOCAL_DEPTH.with(|d| d.set(local + 1));
             self.depth.fetch_add(1, Ordering::Relaxed);
             eprintln!(
+                "[DBG-HOLDER] enter-nested current_tid={:?} id={} owner={} owner_line={} holder_tid={:?} level={}",
+                tid,
+                id,
+                self.owner(),
+                self.holder_line.load(Ordering::Relaxed),
+                self.holder_tid_dbg(),
+                self.level()
+            );
+            eprintln!(
                 "[DBG-THREAD] enter-nested tid={:?} id={} local={} owner={} level={}",
                 tid,
                 id,
@@ -274,6 +304,15 @@ impl KernLock {
         if id != 0 && self.holder.load(Ordering::Relaxed) == id {
             GKL_LOCAL_DEPTH.with(|d| d.set(1));
             self.depth.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "[DBG-HOLDER] enter-same-owner current_tid={:?} id={} owner={} owner_line={} holder_tid={:?} level={}",
+                tid,
+                id,
+                self.owner(),
+                self.holder_line.load(Ordering::Relaxed),
+                self.holder_tid_dbg(),
+                self.level()
+            );
             eprintln!(
                 "[DBG-THREAD] enter-same-owner tid={:?} id={} owner={} owner_line={} level={}",
                 tid,
@@ -309,8 +348,20 @@ impl KernLock {
 
         self.holder.store(id, Ordering::Relaxed);
         self.holder_line.store(caller.line() as usize, Ordering::Relaxed);
+        self.set_holder_tid_dbg(Some(tid));
         self.depth.store(1, Ordering::Relaxed);
         GKL_LOCAL_DEPTH.with(|d| d.set(1));
+        eprintln!(
+            "[DBG-HOLDER] enter-acquired current_tid={:?} id={} caller={}:{} owner={} owner_line={} holder_tid={:?} level={}",
+            tid,
+            id,
+            caller.file(),
+            caller.line(),
+            self.owner(),
+            self.holder_line.load(Ordering::Relaxed),
+            self.holder_tid_dbg(),
+            self.level()
+        );
         eprintln!(
             "[DBG-THREAD] enter-acquired tid={:?} id={} caller={}:{} owner={} owner_line={} level={}",
             tid,
@@ -335,6 +386,17 @@ impl KernLock {
         let caller = std::panic::Location::caller();
         let local = GKL_LOCAL_DEPTH.with(|d| d.get());
         let tid = std::thread::current().id();
+        eprintln!(
+            "[DBG-HOLDER] leave current_tid={:?} caller={}:{} local={} owner={} owner_line={} holder_tid={:?} level={}",
+            tid,
+            caller.file(),
+            caller.line(),
+            local,
+            self.owner(),
+            self.holder_line.load(Ordering::Relaxed),
+            self.holder_tid_dbg(),
+            self.level()
+        );
         eprintln!(
             "[DBG-THREAD] leave tid={:?} caller={}:{} local={} held={} owner={} owner_line={} level={}",
             tid,
@@ -372,6 +434,15 @@ impl KernLock {
             GKL_LOCAL_DEPTH.with(|d| d.set(local - 1));
             self.depth.fetch_sub(1, Ordering::Relaxed);
             eprintln!(
+                "[DBG-HOLDER] leave-nested-done current_tid={:?} local={} owner={} owner_line={} holder_tid={:?} level={}",
+                tid,
+                local - 1,
+                self.owner(),
+                self.holder_line.load(Ordering::Relaxed),
+                self.holder_tid_dbg(),
+                self.level()
+            );
+            eprintln!(
                 "[DBG-THREAD] leave-nested-done tid={:?} local={} owner={} owner_line={} level={}",
                 tid,
                 local - 1,
@@ -400,6 +471,15 @@ impl KernLock {
         if d > 1 {
             self.depth.fetch_sub(1, Ordering::Relaxed);
             eprintln!(
+                "[DBG-HOLDER] leave-global-nested-done current_tid={:?} local={} owner={} owner_line={} holder_tid={:?} level={}",
+                tid,
+                local,
+                self.owner(),
+                self.holder_line.load(Ordering::Relaxed),
+                self.holder_tid_dbg(),
+                self.level()
+            );
+            eprintln!(
                 "[DBG-THREAD] leave-global-nested-done tid={:?} local={} owner={} owner_line={} level={}",
                 tid,
                 local,
@@ -417,8 +497,18 @@ impl KernLock {
 
         self.holder.store(0, Ordering::Relaxed);
         self.holder_line.store(0, Ordering::Relaxed);
+        self.set_holder_tid_dbg(None);
         self.depth.store(0, Ordering::Relaxed);
         self.flag.store(false, Ordering::Release);
+        eprintln!(
+            "[DBG-HOLDER] leave-released current_tid={:?} local={} owner={} owner_line={} holder_tid={:?} level={}",
+            tid,
+            local,
+            self.owner(),
+            self.holder_line.load(Ordering::Relaxed),
+            self.holder_tid_dbg(),
+            self.level()
+        );
         eprintln!(
             "[DBG-THREAD] leave-released tid={:?} local={} held={} owner={} owner_line={} level={}",
             tid,
@@ -447,6 +537,17 @@ impl KernLock {
         let local = GKL_LOCAL_DEPTH.with(|d| d.get());
         let tid = std::thread::current().id();
         eprintln!(
+            "[DBG-HOLDER] try_enter current_tid={:?} id={} caller={}:{} owner={} owner_line={} holder_tid={:?} level={}",
+            tid,
+            id,
+            caller.file(),
+            caller.line(),
+            self.owner(),
+            self.holder_line.load(Ordering::Relaxed),
+            self.holder_tid_dbg(),
+            self.level()
+        );
+        eprintln!(
             "[DBG-THREAD] try_enter tid={:?} id={} caller={}:{} local={} held={} owner={} owner_line={} level={}",
             tid,
             id,
@@ -473,6 +574,15 @@ impl KernLock {
             GKL_LOCAL_DEPTH.with(|d| d.set(local + 1));
             self.depth.fetch_add(1, Ordering::Relaxed);
             eprintln!(
+                "[DBG-HOLDER] try-enter-nested current_tid={:?} id={} owner={} owner_line={} holder_tid={:?} level={}",
+                tid,
+                id,
+                self.owner(),
+                self.holder_line.load(Ordering::Relaxed),
+                self.holder_tid_dbg(),
+                self.level()
+            );
+            eprintln!(
                 "[DBG-THREAD] try-enter-nested tid={:?} id={} local={} owner={} owner_line={} level={}",
                 tid,
                 id,
@@ -497,6 +607,15 @@ impl KernLock {
             GKL_LOCAL_DEPTH.with(|d| d.set(1));
             self.depth.fetch_add(1, Ordering::Relaxed);
             eprintln!(
+                "[DBG-HOLDER] try-enter-same-owner current_tid={:?} id={} owner={} owner_line={} holder_tid={:?} level={}",
+                tid,
+                id,
+                self.owner(),
+                self.holder_line.load(Ordering::Relaxed),
+                self.holder_tid_dbg(),
+                self.level()
+            );
+            eprintln!(
                 "[DBG-THREAD] try-enter-same-owner tid={:?} id={} owner={} owner_line={} level={}",
                 tid,
                 id,
@@ -519,8 +638,20 @@ impl KernLock {
         if self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
             self.holder.store(id, Ordering::Relaxed);
             self.holder_line.store(caller.line() as usize, Ordering::Relaxed);
+            self.set_holder_tid_dbg(Some(tid));
             self.depth.store(1, Ordering::Relaxed);
             GKL_LOCAL_DEPTH.with(|d| d.set(1));
+            eprintln!(
+                "[DBG-HOLDER] try-enter-acquired current_tid={:?} id={} caller={}:{} owner={} owner_line={} holder_tid={:?} level={}",
+                tid,
+                id,
+                caller.file(),
+                caller.line(),
+                self.owner(),
+                self.holder_line.load(Ordering::Relaxed),
+                self.holder_tid_dbg(),
+                self.level()
+            );
             eprintln!(
                 "[DBG-THREAD] try-enter-acquired tid={:?} id={} caller={}:{} owner={} owner_line={} level={}",
                 tid,
