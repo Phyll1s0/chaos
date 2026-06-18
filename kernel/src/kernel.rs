@@ -2681,14 +2681,8 @@ impl BlockCache {
         Some(result)
     }
     pub fn sync_all(&self, id: usize) {
-        if GKL.holder.load(Ordering::Relaxed) == id && id != 0 {
-            GKL.depth.fetch_add(1, Ordering::Relaxed);
-        } else {
-            while GKL.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                core::hint::spin_loop();
-            }
-            GKL.holder.store(id, Ordering::Relaxed);
-            GKL.depth.store(1, Ordering::Relaxed);
+        if !GKL.try_enter(id) {
+            return;
         }
         let mut synced = 0usize;
         for chain_idx in 0..self.chains.len() {
@@ -4591,15 +4585,10 @@ impl Kernel {
         }
     }
     pub fn tick(&self, id: usize) {
-        if GKL.holder.load(Ordering::Relaxed) == id && id != 0 {
-            GKL.depth.fetch_add(1, Ordering::Relaxed);
-        } else {
-            while GKL.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() { core::hint::spin_loop(); }
-            GKL.holder.store(id, Ordering::Relaxed);
-            GKL.depth.store(1, Ordering::Relaxed);
-        }
+        let got_gkl = GKL.try_enter(id);
+        
         let _ir = {
-            let cg = self.cpus.lock().unwrap();
+            let cg: std::sync::MutexGuard<'_, [Option<Arc<Task>>; 8]> = self.cpus.lock().unwrap();
             let mut occ = 0u32;
             for (i, sl) in cg.iter().enumerate() {
                 if sl.is_some() { occ |= 1 << i; }
@@ -4608,17 +4597,23 @@ impl Kernel {
             let total = MAX_CPU;
             if total > 0 { ((total - busy) * 100) / total } else { 100 }
         };
-        {
+        if got_gkl {
             for ci in 0..self.cache.chains.len() {
                 let ch = &self.cache.chains[ci];
-                while ch.lk.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() { core::hint::spin_loop(); }
-                { let mut items = ch.items.lock().unwrap(); for s in items.iter_mut() { s.modified = false; } }
+                while ch.lk.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                    core::hint::spin_loop();
+                }
+                {
+                    let mut items = ch.items.lock().unwrap();
+                    for s in items.iter_mut() {
+                        s.modified = false;
+                    }
+                }
                 ch.lk.v.store(false, Ordering::Release);
             }
+
+            GKL.leave();
         }
-        GKL.holder.store(0, Ordering::Relaxed);
-        GKL.depth.store(0, Ordering::Relaxed);
-        GKL.flag.store(false, Ordering::Release);
     }
     pub fn cur_task(&self, cpu: usize) -> Option<Arc<Task>> {
         let cg = self.cpus.lock().unwrap();
