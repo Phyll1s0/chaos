@@ -82,3 +82,31 @@ fn personal_cache_sync_under_chain_lock() {
 
     assert!(done, "BlockCache::sync_all should not deadlock when a cache chain is already held");
 }
+
+#[test]
+fn personal_cache_memory_foreign_gkl_chain() {
+    let k = Arc::new(Kernel::new(16));
+
+    GKL.enter(2010);
+    k.cache.sync_all(2010);
+
+    let kk = k.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let r = kk.pool.get(2099);
+        let _ = tx.send(r);
+    });
+
+    let early = rx.recv_timeout(Duration::from_millis(100));
+    GKL.leave();
+
+    if early.is_err() {
+        let _ = rx.recv_timeout(Duration::from_millis(1000));
+    }
+    let _ = worker.join();
+
+    assert!(
+        early.is_err(),
+        "FramePool::get should not enter get_inner while another thread holds GKL"
+    );
+}

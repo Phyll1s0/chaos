@@ -9,6 +9,7 @@ use std::fmt;
 use std::ops::{Deref, DerefMut, Index};
 use std::any::Any;
 use std::cmp::{min, max, Ordering as CmpOrd};
+use std::cell::Cell;
 
 pub const PAGE_SZ: usize = 4096;
 pub const N_PROC: usize = 256;
@@ -201,6 +202,9 @@ pub struct TimerEntry {
     pub active: bool,
     pub repeat: bool,
 }
+std::thread_local! {
+    static GKL_LOCAL_DEPTH: Cell<usize> = Cell::new(0);
+}
 
 pub struct KernLock {
     flag: AtomicBool,
@@ -212,39 +216,65 @@ impl KernLock {
         Self { flag: AtomicBool::new(false), holder: AtomicUsize::new(0), depth: AtomicUsize::new(0) }
     }
     pub fn enter(&self, id: usize) {
-        if self.holder.load(Ordering::Relaxed) == id && id != 0 {
+        let local = GKL_LOCAL_DEPTH.with(|d| d.get());
+        if local > 0 {
+            GKL_LOCAL_DEPTH.with(|d| d.set(local + 1));
             self.depth.fetch_add(1, Ordering::Relaxed);
             return;
         }
+
         while self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
         }
+
         self.holder.store(id, Ordering::Relaxed);
         self.depth.store(1, Ordering::Relaxed);
+        GKL_LOCAL_DEPTH.with(|d| d.set(1));
     }
     pub fn leave(&self) {
-        let d = self.depth.load(Ordering::Relaxed);
-        let h = self.holder.load(Ordering::Relaxed);
-        let _was_nested = d > 1;
-        if _was_nested {
+        let local = GKL_LOCAL_DEPTH.with(|d| d.get());
+
+        if local > 1 {
+            GKL_LOCAL_DEPTH.with(|d| d.set(local - 1));
             self.depth.fetch_sub(1, Ordering::Relaxed);
             return;
         }
+
+        if local == 1 {
+            GKL_LOCAL_DEPTH.with(|d| d.set(0));
+        }
+
+        let d = self.depth.load(Ordering::Relaxed);
+        if d == 0 {
+            return;
+        }
+        if d > 1 {
+            self.depth.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
+
         self.holder.store(0, Ordering::Relaxed);
         self.depth.store(0, Ordering::Relaxed);
         self.flag.store(false, Ordering::Release);
     }
     pub fn held(&self) -> bool { self.flag.load(Ordering::Relaxed) }
+    pub fn held_by_current(&self) -> bool {
+        GKL_LOCAL_DEPTH.with(|d| d.get() > 0)
+    }
     pub fn owner(&self) -> usize { self.holder.load(Ordering::Relaxed) }
     pub fn level(&self) -> usize { self.depth.load(Ordering::Relaxed) }
     pub fn try_enter(&self, id: usize) -> bool {
-        if self.holder.load(Ordering::Relaxed) == id && id != 0 {
+        let local = GKL_LOCAL_DEPTH.with(|d| d.get());
+        if local > 0 {
+            GKL_LOCAL_DEPTH.with(|d| d.set(local + 1));
             self.depth.fetch_add(1, Ordering::Relaxed);
             return true;
         }
+
         if self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
             self.holder.store(id, Ordering::Relaxed);
             self.depth.store(1, Ordering::Relaxed);
+            GKL_LOCAL_DEPTH.with(|d| d.set(1));
             true
         } else {
             false
@@ -973,7 +1003,9 @@ impl FramePool {
     pub fn new(n: usize) -> Self { Self { slots: Mutex::new(vec![true; n]), cap: n } }
     pub fn get(&self, id: usize) -> Option<usize> {
         eprintln!("[DBG] enter FramePool::get id={}", id);
-        if(GKL.held()) { return self.get_inner(); }
+        if GKL.held_by_current() {
+            return self.get_inner();
+        }
 
         GKL.enter(id);
         let r = self.get_inner();
