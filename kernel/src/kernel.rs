@@ -215,14 +215,36 @@ impl KernLock {
     pub const fn new() -> Self {
         Self { flag: AtomicBool::new(false), holder: AtomicUsize::new(0), depth: AtomicUsize::new(0) }
     }
+    #[track_caller]
     pub fn enter(&self, id: usize) {
+        let caller = std::panic::Location::caller();
         let local = GKL_LOCAL_DEPTH.with(|d| d.get());
+        eprintln!(
+            "[DBG] enter KernLock::enter id={} caller={}:{} local={} held={} owner={} level={}",
+            id,
+            caller.file(),
+            caller.line(),
+            local,
+            self.held(),
+            self.owner(),
+            self.level()
+        );
         if local > 0 {
             GKL_LOCAL_DEPTH.with(|d| d.set(local + 1));
             self.depth.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "[DBG] KernLock::enter nested id={} caller={}:{} local={} owner={} level={}",
+                id,
+                caller.file(),
+                caller.line(),
+                local + 1,
+                self.owner(),
+                self.level()
+            );
             return;
         }
 
+        eprintln!("[DBG] KernLock::enter before spin id={} caller={}:{}", id, caller.file(), caller.line());
         while self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
         }
@@ -230,11 +252,23 @@ impl KernLock {
         self.holder.store(id, Ordering::Relaxed);
         self.depth.store(1, Ordering::Relaxed);
         GKL_LOCAL_DEPTH.with(|d| d.set(1));
+        eprintln!(
+            "[DBG] KernLock::enter acquired id={} caller={}:{} owner={} level={}",
+            id,
+            caller.file(),
+            caller.line(),
+            self.owner(),
+            self.level()
+        );
     }
+    #[track_caller]
     pub fn leave(&self) {
+        let caller = std::panic::Location::caller();
         let local = GKL_LOCAL_DEPTH.with(|d| d.get());
         eprintln!(
-            "[DBG] enter KernLock::leave local={} held={} owner={} level={}",
+            "[DBG] enter KernLock::leave caller={}:{} local={} held={} owner={} level={}",
+            caller.file(),
+            caller.line(),
             local,
             self.held(),
             self.owner(),
@@ -288,11 +322,32 @@ impl KernLock {
     }
     pub fn owner(&self) -> usize { self.holder.load(Ordering::Relaxed) }
     pub fn level(&self) -> usize { self.depth.load(Ordering::Relaxed) }
+    #[track_caller]
     pub fn try_enter(&self, id: usize) -> bool {
+        let caller = std::panic::Location::caller();
         let local = GKL_LOCAL_DEPTH.with(|d| d.get());
+        eprintln!(
+            "[DBG] enter KernLock::try_enter id={} caller={}:{} local={} held={} owner={} level={}",
+            id,
+            caller.file(),
+            caller.line(),
+            local,
+            self.held(),
+            self.owner(),
+            self.level()
+        );
         if local > 0 {
             GKL_LOCAL_DEPTH.with(|d| d.set(local + 1));
             self.depth.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "[DBG] KernLock::try_enter nested id={} caller={}:{} local={} owner={} level={}",
+                id,
+                caller.file(),
+                caller.line(),
+                local + 1,
+                self.owner(),
+                self.level()
+            );
             return true;
         }
 
@@ -300,8 +355,24 @@ impl KernLock {
             self.holder.store(id, Ordering::Relaxed);
             self.depth.store(1, Ordering::Relaxed);
             GKL_LOCAL_DEPTH.with(|d| d.set(1));
+            eprintln!(
+                "[DBG] KernLock::try_enter acquired id={} caller={}:{} owner={} level={}",
+                id,
+                caller.file(),
+                caller.line(),
+                self.owner(),
+                self.level()
+            );
             true
         } else {
+            eprintln!(
+                "[DBG] KernLock::try_enter failed id={} caller={}:{} owner={} level={}",
+                id,
+                caller.file(),
+                caller.line(),
+                self.owner(),
+                self.level()
+            );
             false
         }
     }
