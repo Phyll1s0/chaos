@@ -169,3 +169,46 @@ fn personal_check_same_id_2020_helper_thread_completes() {
         "same logical id=2020 helper thread is not the remaining hidden-test blocker"
     );
 }
+
+#[test]
+fn personal_model_timeout_worker_keeps_running() {
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag_c = flag.clone();
+
+    let done = run_with_timeout(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        flag_c.store(true, std::sync::atomic::Ordering::SeqCst);
+    }, 30);
+
+    assert!(!done, "the timeout should fire before the worker finishes");
+
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        flag.load(std::sync::atomic::Ordering::SeqCst),
+        "run_with_timeout does not kill the worker thread after timeout"
+    );
+}
+
+#[test]
+fn personal_model_gkl_is_shared_across_threads() {
+    GKL.enter(8801);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        GKL.enter(8802);
+        GKL.leave();
+        let _ = tx.send(());
+    });
+
+    assert!(
+        rx.recv_timeout(Duration::from_millis(50)).is_err(),
+        "another thread should be blocked while GKL is held"
+    );
+
+    GKL.leave();
+
+    assert!(
+        rx.recv_timeout(Duration::from_millis(500)).is_ok(),
+        "the blocked thread should continue after GKL is released"
+    );
+}
