@@ -233,10 +233,23 @@ impl KernLock {
     }
     pub fn leave(&self) {
         let local = GKL_LOCAL_DEPTH.with(|d| d.get());
+        eprintln!(
+            "[DBG] enter KernLock::leave local={} held={} owner={} level={}",
+            local,
+            self.held(),
+            self.owner(),
+            self.level()
+        );
 
         if local > 1 {
             GKL_LOCAL_DEPTH.with(|d| d.set(local - 1));
             self.depth.fetch_sub(1, Ordering::Relaxed);
+            eprintln!(
+                "[DBG] KernLock::leave nested done local={} owner={} level={}",
+                local - 1,
+                self.owner(),
+                self.level()
+            );
             return;
         }
 
@@ -246,16 +259,28 @@ impl KernLock {
 
         let d = self.depth.load(Ordering::Relaxed);
         if d == 0 {
+            eprintln!("[DBG] KernLock::leave noop depth=0");
             return;
         }
         if d > 1 {
             self.depth.fetch_sub(1, Ordering::Relaxed);
+            eprintln!(
+                "[DBG] KernLock::leave global nested done owner={} level={}",
+                self.owner(),
+                self.level()
+            );
             return;
         }
 
         self.holder.store(0, Ordering::Relaxed);
         self.depth.store(0, Ordering::Relaxed);
         self.flag.store(false, Ordering::Release);
+        eprintln!(
+            "[DBG] KernLock::leave released held={} owner={} level={}",
+            self.held(),
+            self.owner(),
+            self.level()
+        );
     }
     pub fn held(&self) -> bool { self.flag.load(Ordering::Relaxed) }
     pub fn held_by_current(&self) -> bool {
@@ -1013,7 +1038,9 @@ impl FramePool {
         );
         if GKL.held_by_current() {
             eprintln!("[DBG] FramePool::get bypass GKL id={}", id);
-            return self.get_inner();
+            let r = self.get_inner();
+            eprintln!("[DBG] FramePool::get bypass done id={} result={:?}", id, r);
+            return r;
         }
 
         eprintln!("[DBG] FramePool::get before GKL.enter id={}", id);
@@ -1025,6 +1052,7 @@ impl FramePool {
             GKL.level()
         );
         let r = self.get_inner();
+        eprintln!("[DBG] FramePool::get after get_inner id={} result={:?}", id, r);
         eprintln!("[DBG] FramePool::get before GKL.leave id={}", id);
         GKL.leave();
         eprintln!("[DBG] FramePool::get after GKL.leave id={}", id);
