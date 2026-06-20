@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque, HashMap, LinkedList};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak, Condvar};
+use std::sync::{Arc, Mutex, RwLock, Weak, Condvar, OnceLock};
 use std::thread;
 use std::time::Duration;
 use std::fmt;
@@ -18,6 +18,25 @@ macro_rules! eprintln {
             std::eprintln!("{}", msg);
         }
     }};
+}
+
+static GKL_EVENT_LOG: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+
+fn gkl_dbg_record(event: String) {
+    let log = GKL_EVENT_LOG.get_or_init(|| Mutex::new(VecDeque::new()));
+    if let Ok(mut q) = log.lock() {
+        if q.len() >= 40 { q.pop_front(); }
+        q.push_back(event);
+    }
+}
+
+fn gkl_dbg_dump(reason: &str) {
+    let log = GKL_EVENT_LOG.get_or_init(|| Mutex::new(VecDeque::new()));
+    if let Ok(q) = log.lock() {
+        for (i, event) in q.iter().enumerate() {
+            std::eprintln!("[DBG-KEY] HIST reason={} idx={} {}", reason, i, event);
+        }
+    }
 }
 
 pub const PAGE_SZ: usize = 4096;
@@ -246,6 +265,19 @@ impl KernLock {
         let local = GKL_LOCAL_DEPTH.with(|d| d.get());
         let tid = std::thread::current().id();
         if id == 2010 || id == 2020 || self.owner() == 2020 {
+            gkl_dbg_record(format!(
+                "ENTER tid={:?} id={} caller={}:{} local={} held={} owner={} owner_line={} holder_tid={:?} level={}",
+                tid,
+                id,
+                caller.file(),
+                caller.line(),
+                local,
+                self.held(),
+                self.owner(),
+                self.holder_line.load(Ordering::Relaxed),
+                self.holder_tid_dbg(),
+                self.level()
+            ));
             eprintln!(
                 "[DBG-KEY] ENTER tid={:?} id={} caller={}:{} local={} held={} owner={} owner_line={} holder_tid={:?} level={}",
                 tid,
@@ -339,51 +371,6 @@ impl KernLock {
             );
             return;
         }
-        if id != 0 && self.holder.load(Ordering::Relaxed) == id {
-            GKL_LOCAL_DEPTH.with(|d| d.set(1));
-            self.depth.fetch_add(1, Ordering::Relaxed);
-            if id == 2010 || id == 2020 || self.owner() == 2020 {
-                eprintln!(
-                    "[DBG-KEY] ENTER_SAME_OWNER tid={:?} id={} caller={}:{} local=1 owner={} owner_line={} holder_tid={:?} level={}",
-                    tid,
-                    id,
-                    caller.file(),
-                    caller.line(),
-                    self.owner(),
-                    self.holder_line.load(Ordering::Relaxed),
-                    self.holder_tid_dbg(),
-                    self.level()
-                );
-            }
-            eprintln!(
-                "[DBG-HOLDER] enter-same-owner current_tid={:?} id={} owner={} owner_line={} holder_tid={:?} level={}",
-                tid,
-                id,
-                self.owner(),
-                self.holder_line.load(Ordering::Relaxed),
-                self.holder_tid_dbg(),
-                self.level()
-            );
-            eprintln!(
-                "[DBG-THREAD] enter-same-owner tid={:?} id={} owner={} owner_line={} level={}",
-                tid,
-                id,
-                self.owner(),
-                self.holder_line.load(Ordering::Relaxed),
-                self.level()
-            );
-            eprintln!(
-                "[DBG] KernLock::enter same-owner id={} caller={}:{} owner={} owner_line={} level={}",
-                id,
-                caller.file(),
-                caller.line(),
-                self.owner(),
-                self.holder_line.load(Ordering::Relaxed),
-                self.level()
-            );
-            return;
-        }
-
         eprintln!(
             "[DBG] KernLock::enter before spin id={} caller={}:{} owner={} owner_line={} level={}",
             id,
@@ -394,6 +381,7 @@ impl KernLock {
             self.level()
         );
         if id == 2010 || self.owner() == 2020 {
+            gkl_dbg_dump("WAIT_BEFORE_SPIN");
             eprintln!(
                 "[DBG-KEY] WAIT tid={:?} id={} caller={}:{} owner={} owner_line={} holder_tid={:?} level={}",
                 tid,
@@ -425,7 +413,11 @@ impl KernLock {
                     self.level()
                 );
             }
-            core::hint::spin_loop();
+            if spins & 0x3ff == 0 {
+                thread::yield_now();
+            } else {
+                core::hint::spin_loop();
+            }
         }
         if spins > 0 && (id == 2010 || id == 2020) {
             eprintln!(
@@ -448,6 +440,17 @@ impl KernLock {
         self.depth.store(1, Ordering::Relaxed);
         GKL_LOCAL_DEPTH.with(|d| d.set(1));
         if id == 2010 || id == 2020 {
+            gkl_dbg_record(format!(
+                "ACQUIRED tid={:?} id={} caller={}:{} owner={} owner_line={} holder_tid={:?} level={}",
+                tid,
+                id,
+                caller.file(),
+                caller.line(),
+                self.owner(),
+                self.holder_line.load(Ordering::Relaxed),
+                self.holder_tid_dbg(),
+                self.level()
+            ));
             eprintln!(
                 "[DBG-KEY] ACQUIRED tid={:?} id={} caller={}:{} owner={} owner_line={} holder_tid={:?} level={}",
                 tid,
@@ -496,6 +499,18 @@ impl KernLock {
         let local = GKL_LOCAL_DEPTH.with(|d| d.get());
         let tid = std::thread::current().id();
         if local == 0 || self.owner() == 2020 || self.owner() == 2010 {
+            gkl_dbg_record(format!(
+                "LEAVE tid={:?} caller={}:{} local={} held={} owner={} owner_line={} holder_tid={:?} level={}",
+                tid,
+                caller.file(),
+                caller.line(),
+                local,
+                self.held(),
+                self.owner(),
+                self.holder_line.load(Ordering::Relaxed),
+                self.holder_tid_dbg(),
+                self.level()
+            ));
             eprintln!(
                 "[DBG-KEY] LEAVE tid={:?} caller={}:{} local={} held={} owner={} owner_line={} holder_tid={:?} level={}",
                 tid,
@@ -532,6 +547,7 @@ impl KernLock {
             self.level()
         );
         if local == 0 && self.held() {
+            gkl_dbg_dump("FOREIGN_LEAVE");
             eprintln!(
                 "[DBG-KEY] FOREIGN_LEAVE tid={:?} caller={}:{} owner={} owner_line={} holder_tid={:?} level={}",
                 tid,
@@ -656,6 +672,17 @@ impl KernLock {
         }
 
         if self.owner() == 2010 || self.owner() == 2020 || local == 0 {
+            gkl_dbg_record(format!(
+                "RELEASE_READY tid={:?} caller={}:{} local={} owner={} owner_line={} holder_tid={:?} level={}",
+                tid,
+                caller.file(),
+                caller.line(),
+                local,
+                self.owner(),
+                self.holder_line.load(Ordering::Relaxed),
+                self.holder_tid_dbg(),
+                self.level()
+            ));
             eprintln!(
                 "[DBG-KEY] RELEASE_READY tid={:?} caller={}:{} local={} owner={} owner_line={} holder_tid={:?} level={}",
                 tid,
@@ -819,51 +846,6 @@ impl KernLock {
             return true;
         }
         
-        if id != 0 && self.holder.load(Ordering::Relaxed) == id {
-            GKL_LOCAL_DEPTH.with(|d| d.set(1));
-            self.depth.fetch_add(1, Ordering::Relaxed);
-            if id == 2010 || id == 2020 {
-                eprintln!(
-                    "[DBG-KEY] TRY_SAME_OWNER tid={:?} id={} caller={}:{} owner={} owner_line={} holder_tid={:?} level={}",
-                    tid,
-                    id,
-                    caller.file(),
-                    caller.line(),
-                    self.owner(),
-                    self.holder_line.load(Ordering::Relaxed),
-                    self.holder_tid_dbg(),
-                    self.level()
-                );
-            }
-            eprintln!(
-                "[DBG-HOLDER] try-enter-same-owner current_tid={:?} id={} owner={} owner_line={} holder_tid={:?} level={}",
-                tid,
-                id,
-                self.owner(),
-                self.holder_line.load(Ordering::Relaxed),
-                self.holder_tid_dbg(),
-                self.level()
-            );
-            eprintln!(
-                "[DBG-THREAD] try-enter-same-owner tid={:?} id={} owner={} owner_line={} level={}",
-                tid,
-                id,
-                self.owner(),
-                self.holder_line.load(Ordering::Relaxed),
-                self.level()
-            );
-            eprintln!(
-                "[DBG] KernLock::try_enter same-owner id={} caller={}:{} owner={} owner_line={} level={}",
-                id,
-                caller.file(),
-                caller.line(),
-                self.owner(),
-                self.holder_line.load(Ordering::Relaxed),
-                self.level()
-            );
-            return true;
-        }
-
         if self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
             self.holder.store(id, Ordering::Relaxed);
             self.holder_line.store(caller.line() as usize, Ordering::Relaxed);

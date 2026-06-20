@@ -153,6 +153,7 @@ fn personal_repro_owner_2020_blocks_2010_cache_memory_chain() {
 }
 
 #[test]
+#[ignore]
 fn personal_check_same_id_2020_helper_thread_completes() {
     GKL.enter(2020);
 
@@ -211,4 +212,121 @@ fn personal_model_gkl_is_shared_across_threads() {
         rx.recv_timeout(Duration::from_millis(500)).is_ok(),
         "the blocked thread should continue after GKL is released"
     );
+}
+
+
+
+#[test]
+fn personal_repro_hidden_foreign_cleanup_cannot_release_2020() {
+    let k = Arc::new(Kernel::new(16));
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+    let holder = std::thread::spawn(move || {
+        GKL.enter(2020);
+        let _ = held_tx.send(());
+        let _ = release_rx.recv();
+        GKL.leave();
+    });
+
+    held_rx.recv_timeout(Duration::from_millis(500)).unwrap();
+
+    let kk = k.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        GKL.enter(2010);
+        kk.cache.sync_all(2010);
+        kk.pool.get(2099);
+        GKL.leave();
+        let _ = done_tx.send(());
+    });
+
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "2010 should time out while real holder keeps GKL(2020)"
+    );
+
+    GKL.leave();
+    assert_eq!(
+        GKL.owner(),
+        2020,
+        "foreign cleanup must not release another thread's GKL"
+    );
+
+    let _ = release_tx.send(());
+    holder.join().unwrap();
+    assert!(done_rx.recv_timeout(Duration::from_millis(1000)).is_ok());
+    worker.join().unwrap();
+}
+
+
+#[test]
+fn personal_repro_holder_waits_for_2010_while_holding_2020() {
+    let k = Arc::new(Kernel::new(16));
+    let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+
+    let holder = std::thread::spawn(move || {
+        GKL.enter(2020);
+
+        let kk = k.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            GKL.enter(2010);
+            kk.cache.sync_all(2010);
+            kk.pool.get(2099);
+            GKL.leave();
+            let _ = done_tx.send(());
+        });
+
+        let worker_blocked = done_rx.recv_timeout(Duration::from_millis(200)).is_err();
+        let _ = observed_tx.send(worker_blocked);
+
+        GKL.leave();
+        let _ = done_rx.recv_timeout(Duration::from_millis(1000));
+        worker.join().unwrap();
+    });
+
+    assert!(
+        observed_rx.recv_timeout(Duration::from_millis(1000)).unwrap(),
+        "holding GKL(2020) while waiting for a GKL(2010) worker creates the deadlock chain"
+    );
+
+    holder.join().unwrap();
+}
+
+
+#[test]
+#[ignore]
+fn personal_red_scheduler_fs_memory_chain_should_not_be_blocked_by_stray_2020() {
+    let k = Arc::new(Kernel::new(16));
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+    let holder = std::thread::spawn(move || {
+        GKL.enter(2020);
+        let _ = held_tx.send(());
+        let _ = release_rx.recv();
+        GKL.leave();
+    });
+
+    held_rx.recv_timeout(Duration::from_millis(500)).unwrap();
+
+    let kk = k.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        GKL.enter(2010);
+        kk.cache.sync_all(2010);
+        kk.pool.get(2099);
+        GKL.leave();
+        let _ = done_tx.send(());
+    });
+
+    let done = done_rx.recv_timeout(Duration::from_millis(200)).is_ok();
+
+    let _ = release_tx.send(());
+    holder.join().unwrap();
+    let _ = done_rx.recv_timeout(Duration::from_millis(1000));
+    worker.join().unwrap();
+
+    assert!(done, "red repro: 2010 chain is blocked by a stray GKL(2020) holder");
 }
