@@ -1675,73 +1675,62 @@ pub struct FramePool {
     cap: usize,
 }
 impl FramePool {
-    pub fn new(n: usize) -> Self { Self { slots: Mutex::new(vec![true; n]), cap: n } }
-    pub fn get(&self, id: usize) -> Option<usize> {
-        eprintln!("[DBG] enter FramePool::get id={}", id);
-        eprintln!(
-            "[DBG] FramePool::get state id={} gkl_held={} by_current={} owner={} level={}",
-            id,
-            GKL.held(),
-            GKL.held_by_current(),
-            GKL.owner(),
-            GKL.level()
-        );
-        if GKL.held_by_current() {
-            eprintln!("[DBG] FramePool::get bypass GKL id={}", id);
-            let r = self.get_inner();
-            eprintln!("[DBG] FramePool::get bypass done id={} result={:?}", id, r);
-            return r;
+    pub fn new(frame_count: usize) -> Self {
+        Self {
+            slots: Mutex::new(vec![true; frame_count]),
+            cap: frame_count,
         }
-
-        eprintln!("[DBG] FramePool::get before GKL.enter id={}", id);
-        GKL.enter(id);
-        eprintln!(
-            "[DBG] FramePool::get after GKL.enter id={} owner={} level={}",
-            id,
-            GKL.owner(),
-            GKL.level()
-        );
-        let r = self.get_inner();
-        eprintln!("[DBG] FramePool::get after get_inner id={} result={:?}", id, r);
-        eprintln!("[DBG] FramePool::get before GKL.leave id={}", id);
-        GKL.leave();
-        eprintln!("[DBG] FramePool::get after GKL.leave id={}", id);
-        r
     }
-    pub fn get_inner(&self) -> Option<usize> {
-        eprintln!("[DBG] enter FramePool::get_inner");
-        eprintln!("[DBG] FramePool::get_inner before slots lock");
-        let mut s = self.slots.lock().unwrap();
-        eprintln!("[DBG] FramePool::get_inner got slots lock");
-        for (i, f) in s.iter_mut().enumerate() {
-            if *f {
-                *f = false;
-                eprintln!("[DBG] FramePool::get_inner alloc idx={}", i);
-                return Some(i);
+
+    fn take_first_free(slots: &mut [bool]) -> Option<usize> {
+        for (frame_index, is_free) in slots.iter_mut().enumerate() {
+            if *is_free {
+                *is_free = false;
+                return Some(frame_index);
             }
         }
-        eprintln!("[DBG] FramePool::get_inner no free frame");
         None
     }
-    pub fn get_contig(&self, sz: usize, align_log2: usize) -> Option<usize> {
-        let mut s = self.slots.lock().unwrap();
-        let a = 1usize << align_log2;
-        for start in (0..s.len()).step_by(if a > 0 { a } else { 1 }) {
-            if start + sz > s.len() { break; }
-            if (start..start + sz).all(|i| s[i]) {
-                for i in start..start + sz { s[i] = false; }
+
+    pub fn get(&self, id: usize) -> Option<usize> {
+        // The global kernel lock is reentrant per thread. If the caller already
+        // holds it, allocate directly instead of trying to acquire it again.
+        if GKL.held_by_current() {
+            return self.get_inner();
+        }
+
+        GKL.enter(id);
+        let frame = self.get_inner();
+        GKL.leave();
+        frame
+    }
+
+    pub fn get_inner(&self) -> Option<usize> {
+        let mut slots = self.slots.lock().unwrap();
+        Self::take_first_free(&mut slots)
+    }
+
+    pub fn get_contig(&self, frame_count: usize, align_log2: usize) -> Option<usize> {
+        let mut slots = self.slots.lock().unwrap();
+        let alignment = 1usize << align_log2;
+        for start in (0..slots.len()).step_by(if alignment > 0 { alignment } else { 1 }) {
+            if start + frame_count > slots.len() { break; }
+            if (start..start + frame_count).all(|i| slots[i]) {
+                for i in start..start + frame_count { slots[i] = false; }
                 return Some(start);
             }
         }
         None
     }
-    pub fn put(&self, idx: usize) {
-        let mut s = self.slots.lock().unwrap();
-        if idx < s.len() { s[idx] = true; }
+
+    pub fn put(&self, frame_index: usize) {
+        let mut slots = self.slots.lock().unwrap();
+        if frame_index < slots.len() { slots[frame_index] = true; }
     }
-    pub fn avail(&self, idx: usize) -> bool {
-        let s = self.slots.lock().unwrap();
-        idx < s.len() && s[idx]
+
+    pub fn avail(&self, frame_index: usize) -> bool {
+        let slots = self.slots.lock().unwrap();
+        frame_index < slots.len() && slots[frame_index]
     }
     pub fn free_count(&self) -> usize {
         self.slots.lock().unwrap().iter().filter(|&&f| f).count()
