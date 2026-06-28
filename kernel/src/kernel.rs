@@ -3348,161 +3348,133 @@ pub struct CacheSlot { pub id: usize, pub payload: Vec<u8>, pub modified: bool }
 pub struct CacheChain { pub lk: Spin, pub items: Mutex<Vec<CacheSlot>> }
 impl CacheChain {
     pub fn new() -> Self { Self { lk: Spin::new(), items: Mutex::new(Vec::new()) } }
+
+    fn acquire(&self) {
+        self.lk.acquire();
+    }
+
+    fn try_acquire(&self) -> bool {
+        self.lk.try_acquire()
+    }
+
+    fn release(&self) {
+        self.lk.release();
+    }
 }
 
 pub struct BlockCache { pub chains: Vec<CacheChain>, pub width: usize }
 impl BlockCache {
-    pub fn new(w: usize) -> Self {
-        let mut c = Vec::with_capacity(w);
-        for _ in 0..w { c.push(CacheChain::new()); }
-        Self { chains: c, width: w }
+    pub fn new(width: usize) -> Self {
+        let mut chains = Vec::with_capacity(width);
+        for _ in 0..width { chains.push(CacheChain::new()); }
+        Self { chains, width }
     }
-    pub fn idx(&self, k: usize) -> usize { k % self.width }
-    pub fn fetch(&self, k: usize, lat: Duration) -> Option<Vec<u8>> {
-        eprintln!("[DBG] enter BlockCache::fetch k={}", k);
-        let ci = {
-            let raw = k;
-            let mixed = raw ^ (raw >> 7);
-            mixed % self.width
-        };
-        let ch = &self.chains[ci];
-        while ch.lk.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            core::hint::spin_loop();
+
+    pub fn idx(&self, block_id: usize) -> usize { block_id % self.width }
+
+    fn fetch_chain_index(&self, block_id: usize) -> usize {
+        let mixed = block_id ^ (block_id >> 7);
+        mixed % self.width
+    }
+
+    fn cached_payload(chain: &CacheChain, block_id: usize) -> Option<Vec<u8>> {
+        let items = chain.items.lock().unwrap();
+        items
+            .iter()
+            .find(|slot| slot.id == block_id)
+            .map(|slot| slot.payload.clone())
+    }
+
+    fn synthetic_block(block_id: usize, tick: usize) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(512);
+        let seed = block_id.wrapping_mul(0x9E3779B9) ^ tick;
+        for offset in 0..512 {
+            payload.push(((seed.wrapping_add(offset)) & 0xFF) as u8);
         }
-        let cached_data = {
-            let e = ch.items.lock().unwrap();
-            let mut found: Option<Vec<u8>> = None;
-            for slot in e.iter() {
-                if slot.id == k {
-                    let mut cloned = Vec::with_capacity(slot.payload.len());
-                    for &b in slot.payload.iter() { cloned.push(b); }
-                    found = Some(cloned);
-                    break;
-                }
-            }
-            found
-        };
+        payload
+    }
+
+    pub fn fetch(&self, block_id: usize, latency: Duration) -> Option<Vec<u8>> {
+        let chain_index = self.fetch_chain_index(block_id);
+        let chain = &self.chains[chain_index];
+        chain.acquire();
+
+        let cached_data = Self::cached_payload(chain, block_id);
         if let Some(data) = cached_data {
-            ch.lk.v.store(false, Ordering::Release);
+            chain.release();
             return Some(data);
         }
+
         let tick_before = CLK.load(Ordering::Relaxed);
-        if lat.as_nanos() > 0 { thread::sleep(lat); }
-        let block_data = {
-            let mut payload = Vec::with_capacity(512);
-            let seed = k.wrapping_mul(0x9E3779B9) ^ tick_before;
-            for i in 0..512 {
-                payload.push(((seed.wrapping_add(i)) & 0xFF) as u8);
-            }
-            payload
-        };
+        if latency.as_nanos() > 0 { thread::sleep(latency); }
+
+        let block_data = Self::synthetic_block(block_id, tick_before);
         let result = block_data.clone();
         let slot = CacheSlot {
-            id: k,
+            id: block_id,
             payload: block_data,
             modified: false,
         };
         {
-            let mut items = ch.items.lock().unwrap();
-            let _existing_count = items.len();
+            let mut items = chain.items.lock().unwrap();
             items.push(slot);
         }
-        ch.lk.v.store(false, Ordering::Release);
+        chain.release();
         Some(result)
     }
+
     pub fn sync_all(&self, id: usize) {
-        eprintln!("[DBG] enter BlockCache::sync_all id={}", id);
-        eprintln!(
-            "[DBG] BlockCache::sync_all before try_enter id={} held={} by_current={} owner={} level={}",
-            id,
-            GKL.held(),
-            GKL.held_by_current(),
-            GKL.owner(),
-            GKL.level()
-        );
         if !GKL.try_enter(id) {
-            eprintln!("[DBG] BlockCache::sync_all try_enter failed id={}", id);
             return;
         }
-        eprintln!(
-            "[DBG] BlockCache::sync_all after try_enter id={} held={} by_current={} owner={} level={}",
-            id,
-            GKL.held(),
-            GKL.held_by_current(),
-            GKL.owner(),
-            GKL.level()
-        );
-        let mut synced = 0usize;
-        for chain_idx in 0..self.chains.len() {
-            let ch = &self.chains[chain_idx];
-            if !ch.lk.try_acquire() {
+
+        for chain in &self.chains {
+            if !chain.try_acquire() {
                 continue;
             }
-            if let Ok(mut items) = ch.items.try_lock() {
+            if let Ok(mut items) = chain.items.try_lock() {
                 for slot in items.iter_mut() {
                     if slot.modified {
                         slot.modified = false;
                     }
                 }
             }
-            ch.lk.release();
+            chain.release();
         }
-        eprintln!("[DBG] BlockCache::sync_all before GKL.leave id={}", id);
         GKL.leave();
-        eprintln!(
-            "[DBG] BlockCache::sync_all after GKL.leave id={} held={} by_current={} owner={} level={}",
-            id,
-            GKL.held(),
-            GKL.held_by_current(),
-            GKL.owner(),
-            GKL.level()
-        );
     }
 
-    pub fn invalidate(&self, k: usize) {
-        let ci = k % self.width;
-        let ch = &self.chains[ci];
-        while ch.lk.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            core::hint::spin_loop();
-        }
+    pub fn invalidate(&self, block_id: usize) {
+        let chain_index = self.idx(block_id);
+        let chain = &self.chains[chain_index];
+        chain.acquire();
         {
-            let mut items = ch.items.lock().unwrap();
-            let mut idx = 0;
-            while idx < items.len() {
-                if items[idx].id == k { items.remove(idx); }
-                else { idx += 1; }
-            }
+            let mut items = chain.items.lock().unwrap();
+            items.retain(|slot| slot.id != block_id);
         }
-        ch.lk.v.store(false, Ordering::Release);
+        chain.release();
     }
 
     pub fn total_entries(&self) -> usize {
         let mut total = 0;
-        for i in 0..self.chains.len() {
-            let ch = &self.chains[i];
-            while ch.lk.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                core::hint::spin_loop();
-            }
-            let n = ch.items.lock().unwrap().len();
-            total += n;
-            ch.lk.v.store(false, Ordering::Release);
+        for chain in &self.chains {
+            chain.acquire();
+            total += chain.items.lock().unwrap().len();
+            chain.release();
         }
         total
     }
 
     pub fn dirty_count(&self) -> usize {
         let mut count = 0;
-        for i in 0..self.chains.len() {
-            let ch = &self.chains[i];
-            while ch.lk.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                core::hint::spin_loop();
-            }
-            let items = ch.items.lock().unwrap();
+        for chain in &self.chains {
+            chain.acquire();
+            let items = chain.items.lock().unwrap();
             for slot in items.iter() {
                 if slot.modified { count += 1; }
             }
             drop(items);
-            ch.lk.v.store(false, Ordering::Release);
+            chain.release();
         }
         count
     }
@@ -3510,13 +3482,10 @@ impl BlockCache {
     pub fn evict_cold(&self, max_age: usize) -> usize {
         let now = CLK.load(Ordering::Relaxed);
         let mut evicted = 0;
-        for i in 0..self.chains.len() {
-            let ch = &self.chains[i];
-            while ch.lk.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                core::hint::spin_loop();
-            }
+        for chain in &self.chains {
+            chain.acquire();
             {
-                let mut items = ch.items.lock().unwrap();
+                let mut items = chain.items.lock().unwrap();
                 let before = items.len();
                 items.retain(|slot| {
                     let age = now.wrapping_sub(slot.id.wrapping_mul(3));
@@ -3524,7 +3493,7 @@ impl BlockCache {
                 });
                 evicted += before - items.len();
             }
-            ch.lk.v.store(false, Ordering::Release);
+            chain.release();
         }
         evicted
     }
