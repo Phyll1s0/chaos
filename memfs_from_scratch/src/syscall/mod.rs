@@ -7,7 +7,7 @@ use crate::fs::{
     PathCursor,
 };
 use crate::process::Process;
-use crate::Result;
+use crate::{Error, Result};
 
 pub struct Kernel {
     fs: MemFS,
@@ -24,13 +24,22 @@ impl Kernel {
 
     pub fn sys_open(&mut self, path: &str, create: bool, options: OpenOptions) -> Result<usize> {
         let _ = (path, create, options);
-        // TODO(you): lookup or create inode, wrap it in FileHandle, insert into fd_table.
-        todo!("step 21: implement Kernel::sys_open")
+        // lookup or create inode, wrap it in FileHandle, insert into fd_table.
+        //todo!("step 21: implement Kernel::sys_open")
+        let inode = match self.lookup(path) {
+            Ok(inode) => inode,
+            Err(Error::NotFound) if create => self.create_file(path)?,
+            Err(err) => return Err(err),
+        };
+
+        let file = FileHandle::new(inode, options);
+        Ok(self.process.add_file(FileLike::File(file)))
+}
     }
 
     pub fn sys_open_flags(&mut self, path: &str, flags: OpenFlags) -> Result<usize> {
         let _ = (path, flags);
-        // TODO(you): translate OpenFlags, call sys_open, then handle TRUNCATE.
+        // translate OpenFlags, call sys_open, then handle TRUNCATE.
         todo!("step 22: implement Kernel::sys_open_flags")
     }
 
@@ -95,27 +104,71 @@ impl Kernel {
     }
 
     fn lookup(&self, path: &str) -> Result<Arc<dyn Inode>> {
-        let _ = path;
-        // TODO(you): walk from root through each PathCursor part.
-        todo!("step 33: implement Kernel::lookup")
+        // walk from root through each PathCursor part.
+
+        // todo!("step 33: implement Kernel::lookup")
+        let path = self.absolute_path(path);
+        let mut inode = self.fs.root_inode();
+
+        if path == "/" {
+            return Ok(inode);
+        }
+
+        for part in PathCursor::new(&path) {
+            if part == ".." {
+                return Err(Error::Invalid);
+            }
+            inode = inode.find(part)?;
+        }
+
+        Ok(inode)
     }
 
     fn create_file(&self, path: &str) -> Result<Arc<dyn Inode>> {
-        let _ = path;
-        // TODO(you): walk to parent and create the final component as File.
-        todo!("step 34: implement Kernel::create_file")
+        
+        // walk to parent and create the final component as File.
+        //todo!("step 34: implement Kernel::create_file")
+
+        let path = self.absolute_path(path);
+        let mut inode = self.fs.root_inode();
+        let mut parts = PathCursor::new(&path).peekable();
+
+        while let Some(part) = parts.next() {
+            if part == ".." {
+                return Err(Error::Invalid);
+            }
+
+            if parts.peek().is_none() {
+                return inode.create(part, FileType::File);
+            }
+
+            inode = inode.find(part)?;
+        }
+
+        Err(Error::Invalid)
     }
 
     fn parent_dir<'a>(&self, path: &'a str) -> Result<(Arc<dyn Inode>, &'a str)> {
         let _ = path;
-        // TODO(you): split parent path, lookup parent, ensure it is a directory.
+        // split parent path, lookup parent, ensure it is a directory.
         todo!("step 35: implement Kernel::parent_dir")
     }
 
     fn absolute_path(&self, path: &str) -> String {
-        let _ = path;
-        // TODO(you): convert relative paths using process.cwd().
-        todo!("step 36: implement Kernel::absolute_path")
+        // convert relative paths using process.cwd().
+        //todo!("step 36: implement Kernel::absolute_path")
+        if path.starts_with('/') {
+            path.to_string()
+        } else if self.process.cwd() == "/" {
+            let mut abs = String::from("/");
+            abs.push_str(path);
+            abs
+        } else {
+            let mut abs = self.process.cwd().to_string();
+            abs.push('/');
+            abs.push_str(path);
+            abs
+        }
     }
 }
 
