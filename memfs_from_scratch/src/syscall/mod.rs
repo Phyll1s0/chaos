@@ -74,15 +74,17 @@ impl Kernel {
     }
 
     pub fn sys_fstat(&self, fd: usize) -> Result<Metadata> {
-        let _ = fd;
-        // TODO(you): get file metadata through fd.
-        todo!("step 28: implement Kernel::sys_fstat")
+        
+        // get file metadata through fd.
+        //todo!("step 28: implement Kernel::sys_fstat")
+        self.process.get_file_like(fd)?.as_file().metadata()
     }
 
     pub fn sys_ftruncate(&self, fd: usize, len: usize) -> Result<()> {
         let _ = (fd, len);
-        // TODO(you): resize inode through file handle.
-        todo!("step 29: implement Kernel::sys_ftruncate")
+        // resize inode through file handle.
+        //todo!("step 29: implement Kernel::sys_ftruncate")
+        self.process.get_file(fd)?.inode().resize(len)
     }
 
     pub fn sys_lseek(&self, fd: usize, offset: usize) -> Result<()> {
