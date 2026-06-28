@@ -86,7 +86,6 @@ impl Inode for MemInode {
     }
 
     fn write_at(&self, offset: usize, buf: &[u8]) -> Result<usize> {
-        let _ = (offset, buf);
         // resize File { data } if needed, then copy buf into it.
         //todo!("step 3: implement MemInode::write_at")
         match &mut *self.inner.write() {
@@ -112,7 +111,6 @@ impl Inode for MemInode {
     }
 
     fn resize(&self, len: usize) -> Result<()> {
-        let _ = len;
         // resize regular file contents.
         // todo!("step 5: implement MemInode::resize")
         match &mut *self.inner.write() {
@@ -125,7 +123,6 @@ impl Inode for MemInode {
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn Inode>> {
-        let _ = name;
         // find child inode in a directory.
         //todo!("step 6: implement MemInode::find")
         match &*self.inner.read() {
@@ -144,7 +141,6 @@ impl Inode for MemInode {
     }
 
     fn create(&self, name: &str, file_type: FileType) -> Result<Arc<dyn Inode>> {
-        let _ = (name, file_type);
         // create file or dir inside a directory.
         //todo!("step 7: implement MemInode::create")
         match &mut *self.inner.write() {
@@ -166,7 +162,6 @@ impl Inode for MemInode {
     }
 
     fn unlink(&self, name: &str) -> Result<()> {
-        let _ = name;
         // remove a child name from a directory.
         //todo!("step 8: implement MemInode::unlink")
         match &mut *self.inner.write() {
