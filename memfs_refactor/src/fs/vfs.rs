@@ -18,12 +18,14 @@ pub struct Metadata {
 
 pub trait Inode: Send + Sync {
     fn file_type(&self) -> FileType;
+
     fn metadata(&self) -> Metadata {
         Metadata {
             file_type: self.file_type(),
             len: self.len(),
         }
     }
+
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize>;
     fn write_at(&self, offset: usize, buf: &[u8]) -> Result<usize>;
     fn len(&self) -> usize;
