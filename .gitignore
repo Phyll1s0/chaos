@@ -32,3 +32,6 @@ modules/*/target
 test/
 
 .sim-runtime-cache
+
+CR_PREP.md
+MEMFS_WALKTHROUGH.md
