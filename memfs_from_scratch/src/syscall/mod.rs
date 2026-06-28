@@ -39,7 +39,18 @@ impl Kernel {
     pub fn sys_open_flags(&mut self, path: &str, flags: OpenFlags) -> Result<usize> {
         let _ = (path, flags);
         // translate OpenFlags, call sys_open, then handle TRUNCATE.
-        todo!("step 22: implement Kernel::sys_open_flags")
+        //todo!("step 22: implement Kernel::sys_open_flags")
+        let fd = self.sys_open(
+            path,
+            flags.contains(OpenFlags::CREATE),
+            OpenOptions::from_flags(flags),
+        )?;
+
+        if flags.contains(OpenFlags::TRUNCATE) {
+            self.sys_ftruncate(fd, 0)?;
+        }
+
+        Ok(fd)
 
     }
 
