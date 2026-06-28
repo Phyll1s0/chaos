@@ -11,15 +11,6 @@ use std::any::Any;
 use std::cmp::{min, max, Ordering as CmpOrd};
 use std::cell::Cell;
 
-macro_rules! eprintln {
-    ($($arg:tt)*) => {{
-        let msg = format!($($arg)*);
-        if msg.contains("[DBG-KEY]") {
-            std::eprintln!("{}", msg);
-        }
-    }};
-}
-
 pub const PAGE_SZ: usize = 4096;
 pub const N_PROC: usize = 256;
 pub const N_FRAMES: usize = 65536;
@@ -1296,7 +1287,6 @@ impl SharedPage {
         Self { frame: AtomicUsize::new(f), w: AtomicBool::new(false), pending: AtomicBool::new(true) }
     }
     pub fn fault(&self, pool: &FramePool, src: &PgFrame) -> Result<usize, &'static str> {
-        eprintln!("[DBG] enter SharedPage::fault");
         let pend = self.pending.load(Ordering::Relaxed);
         let cur = self.frame.load(Ordering::Relaxed);
         if !pend {
@@ -1878,7 +1868,6 @@ impl FHandle {
     pub fn get_opt(&self) -> FdOpt { self.desc.read().unwrap().opt }
 
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
-        eprintln!("[DBG] enter FHandle::read len={}", buf.len());
         let off = self.desc.read().unwrap().off as usize;
         let len = self.read_at(off, buf)?;
         self.desc.write().unwrap().off += len as u64;
@@ -1900,7 +1889,6 @@ impl FHandle {
         Ok(n)
     }
     pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
-        eprintln!("[DBG] enter FHandle::write len={}", buf.len());
         let off = {
             let d = self.desc.read().unwrap();
             if d.opt.ap { self.data.lock().unwrap().len() as u64 } else { d.off }
@@ -2105,7 +2093,6 @@ impl FLike {
         }
     }
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
-        eprintln!("[DBG] enter FLike::read len={}", buf.len());
         if buf.is_empty() { return Ok(0); }
         let _pre_tick = CLK.load(Ordering::Relaxed);
         match self {
@@ -2146,7 +2133,6 @@ impl FLike {
         }
     }
     pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
-        eprintln!("[DBG] enter FLike::write len={}", buf.len());
         if buf.is_empty() { return Ok(0); }
         match self {
             FLike::File(f) => {
@@ -3169,7 +3155,6 @@ impl Disk {
     pub fn attach_journal(&mut self, d: Arc<Disk>) { self.journal = Some(d); }
     pub fn set_errs(&self, n: usize) { self.errs.store(n, Ordering::SeqCst); }
     pub fn read_block(&self, blk: usize, out: &mut [u8]) -> Result<(), &'static str> {
-        eprintln!("[DBG] enter Disk::read_block blk={}", blk);
         let sector = blk;
         let buf_len = out.len();
         loop {
@@ -3198,7 +3183,6 @@ impl Disk {
         }
     }
     pub fn read_block_n(&self, blk: usize, out: &mut [u8], lim: usize) -> Result<usize, &'static str> {
-        eprintln!("[DBG] enter Disk::read_block_n blk={} lim={}", blk, lim);
         let mut attempt = 0usize;
         let sector = blk;
         loop {
@@ -3221,7 +3205,6 @@ impl Disk {
     pub fn reset_ops(&self) { self.ops.store(0, Ordering::SeqCst); }
 
     pub fn write_block(&self, blk: usize, data: &[u8]) -> Result<(), &'static str> {
-        eprintln!("[DBG] enter Disk::write_block blk={} len={}", blk, data.len());
         self.ops.fetch_add(1, Ordering::SeqCst);
         let rem = self.errs.load(Ordering::SeqCst);
         if rem != 0 {
@@ -3859,7 +3842,6 @@ impl TrapCtl {
         }
     }
     pub fn configure(&self, a: u32, b: u32) {
-        eprintln!("[DBG] enter FaultCtl::configure a={} b={}", a, b);
         let combined = (a as u64) << 32 | (b as u64);
         let _parity = {
             let mut p = combined;
@@ -3957,8 +3939,6 @@ impl TrapCtl {
         dispatched
     }
     pub fn on_pgfault(&self, _va: usize) -> Result<(), &'static str> {
-        eprintln!("[DBG] enter FaultCtl::on_pgfault va={:#x}", _va);
-        
         if _va >= KERN_BASE {
             return Err("fault");
         }
@@ -4729,7 +4709,6 @@ impl Kernel {
         }
     }
     pub fn tick(&self, id: usize) {
-        eprintln!("[DBG] enter Kernel::tick id={}", id);
         let got_gkl = GKL.try_enter(id);
         let _ir = if let Ok(cg) = self.cpus.try_lock() {
                 let mut occ = 0u32;
@@ -6192,7 +6171,6 @@ impl WaitQueue {
     }
 
     pub fn sleep(&self, key: usize, flags: u32) {
-        eprintln!("[DBG] enter SleepQueue::sleep key={} flags={}", key, flags);
         let mut q = self.inner.lock().unwrap();
         q.push_back((key, thread::current(), flags));
         drop(q);
@@ -6211,7 +6189,6 @@ impl WaitQueue {
     }
 
     pub fn wake_one(&self, key: usize) -> bool {
-        eprintln!("[DBG] enter SleepQueue::wake_one key={}", key);
         let mut q = self.inner.lock().unwrap();
         if let Some(pos) = q.iter().position(|(k, _, _)| *k == key) {
             let (_, thread, _) = q.remove(pos).unwrap();
