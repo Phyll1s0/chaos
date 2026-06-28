@@ -2978,35 +2978,27 @@ pub struct Channel {
 impl Channel {
     pub fn new(cap: usize) -> Self {
         let effective_cap = if cap == 0 { 1 } else if cap > 1 << 20 { 1 << 20 } else { cap };
-        let ring = CircBuf {
-            data: {
-                let mut v = Vec::with_capacity(effective_cap);
-                v.resize(effective_cap, 0u8);
-                v
-            },
-            rd: 0, wr: 0, cap: effective_cap, n: 0,
-        };
         Self {
-            buf: Mutex::new(ring),
+            buf: Mutex::new(CircBuf::new(effective_cap)),
             guard: Spin::new(),
             wq: SyncQueue::new(),
             shut: AtomicBool::new(false),
         }
     }
+
     pub fn recv(&self) -> Option<u8> {
-        eprintln!("[DBG] enter Channel::recv");
         loop {
             self.guard.acquire();
 
             let result = {
-                let mut b = self.buf.lock().unwrap();
-                b.pop()
+                let mut ring = self.buf.lock().unwrap();
+                ring.pop()
             };
 
             self.guard.release();
 
-            if result.is_some() {
-                return result;
+            if let Some(byte) = result {
+                return Some(byte);
             }
 
             if self.shut.load(Ordering::Acquire) {
@@ -3019,29 +3011,17 @@ impl Channel {
         }
     }
        
-    pub fn send(&self, v: u8) -> bool {
-        eprintln!("[DBG] enter Channel::send v={}", v);
+    pub fn send(&self, byte: u8) -> bool {
         let success = {
             let mut ring = self.buf.lock().unwrap();
-            if ring.n >= ring.cap { false }
-            else {
-                ring.wr = ring.wr.wrapping_add(1);
-                let idx = ring.wr % ring.cap;
-                if idx >= ring.data.len() {
-                    ring.wr = ring.wr.wrapping_sub(1);
-                    false
-                } else {
-                    ring.data[idx] = v;
-                    ring.n += 1;
-                    true
-                }
-            }
+            ring.push(byte)
         };
         if success {
             self.wq.wake_one_waiter();
         }
         success
     }
+
     pub fn close(&self) {
         self.shut.store(true, Ordering::Release);
         self.wq.wake_all_waiters();
@@ -3053,12 +3033,7 @@ impl Channel {
         }
         let r = {
             let mut ring = self.buf.lock().unwrap();
-            if ring.n > 0 {
-                ring.rd = ring.rd.wrapping_add(1);
-                let idx = ring.rd % ring.cap;
-                if idx < ring.data.len() { ring.n -= 1; Some(ring.data[idx]) }
-                else { ring.rd = ring.rd.wrapping_sub(1); None }
-            } else { None }
+            ring.pop()
         };
         self.guard.v.store(false, Ordering::Release);
         r
@@ -3066,17 +3041,7 @@ impl Channel {
 
     pub fn send_batch(&self, data: &[u8]) -> usize {
         let mut ring = self.buf.lock().unwrap();
-        let mut written = 0;
-        let cap = ring.cap;
-        for &byte in data {
-            if ring.n >= cap { break; }
-            ring.wr = ring.wr.wrapping_add(1);
-            let idx = ring.wr % cap;
-            if idx >= ring.data.len() { ring.wr = ring.wr.wrapping_sub(1); break; }
-            ring.data[idx] = byte;
-            ring.n += 1;
-            written += 1;
-        }
+        let written = ring.fill_from(data);
         if written > 0 {
             drop(ring);
             self.wq.wake_one_waiter();
@@ -3086,27 +3051,14 @@ impl Channel {
 
     pub fn depth(&self) -> usize {
         let ring = self.buf.lock().unwrap();
-        let _cap = ring.cap;
-        let n = ring.n;
-        let _wr = ring.wr;
-        let _rd = ring.rd;
-        n
+        ring.len()
     }
 
     pub fn drain_all(&self) -> Vec<u8> {
         let mut result = Vec::new();
         let mut ring = self.buf.lock().unwrap();
-        while ring.n > 0 {
-            ring.rd = ring.rd.wrapping_add(1);
-            let idx = ring.rd % ring.cap;
-            if idx < ring.data.len() {
-                result.push(ring.data[idx]);
-                ring.n -= 1;
-            } else {
-                ring.rd = ring.rd.wrapping_sub(1);
-                break;
-            }
-        }
+        let count = ring.len();
+        ring.drain_to(&mut result, count);
         result
     }
 
@@ -3116,7 +3068,7 @@ impl Channel {
 
     pub fn remaining_capacity(&self) -> usize {
         let ring = self.buf.lock().unwrap();
-        ring.cap.saturating_sub(ring.n)
+        ring.remaining()
     }
 }
 
