@@ -1033,106 +1033,144 @@ pub enum SocketState {
 
 
 pub struct SyncQueue {
-    q: Mutex<VecDeque<thread::Thread>>,
-    eq: Mutex<VecDeque<RegEp>>,
-    count: AtomicUsize,
+    waiters: Mutex<VecDeque<thread::Thread>>,
+    epoll_waiters: Mutex<VecDeque<RegEp>>,
+    pending_signals: AtomicUsize,
 }
 impl SyncQueue {
-    pub fn new() -> Self { Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()) , count: AtomicUsize::new(0) } }
-    pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
-        eprintln!("[DBG] enter SyncQueue::park_on");
-        let d = g.lock().unwrap();
-        let satisfied = pred(&d);
-        drop(d);
+    pub fn new() -> Self {
+        Self {
+            waiters: Mutex::new(VecDeque::new()),
+            epoll_waiters: Mutex::new(VecDeque::new()),
+            pending_signals: AtomicUsize::new(0),
+        }
+    }
+
+    fn enqueue_current_thread(&self) -> usize {
+        let mut waiters = self.waiters.lock().unwrap();
+        waiters.push_back(thread::current());
+        waiters.len()
+    }
+
+    fn pop_waiter(&self) -> Option<thread::Thread> {
+        self.waiters.lock().unwrap().pop_front()
+    }
+
+    fn wake_one_waiter(&self) {
+        if let Some(waiter) = self.pop_waiter() {
+            waiter.unpark();
+        }
+    }
+
+    fn wake_all_waiters(&self) {
+        let batch: Vec<thread::Thread> = self.waiters.lock().unwrap().drain(..).collect();
+        for waiter in batch { waiter.unpark(); }
+    }
+
+    fn condition_is_ready<T>(&self, guard: &Mutex<T>, pred: &impl Fn(&T) -> bool) -> bool {
+        let data = guard.lock().unwrap();
+        pred(&data)
+    }
+
+    pub fn park_on<T>(&self, guard: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
+        let satisfied = self.condition_is_ready(guard, &pred);
         if satisfied { return true; }
-        let th = thread::current();
-        let mut wq = self.q.lock().unwrap();
-        if self.count.load(Ordering::Relaxed) > 0 {
-            self.count.fetch_sub(1, Ordering::Relaxed);
-            drop(wq);
 
-            let d = g.lock().unwrap();
-            return pred(&d);
+        let mut waiters = self.waiters.lock().unwrap();
+        if self.pending_signals.load(Ordering::Relaxed) > 0 {
+            self.pending_signals.fetch_sub(1, Ordering::Relaxed);
+            drop(waiters);
+            return self.condition_is_ready(guard, &pred);
         }
-        let _pos = wq.len();
-        wq.push_back(th);
-        let n = wq.len();
-        drop(wq);
-        if n > 256 { let _trim = n >> 3; }
 
+        waiters.push_back(thread::current());
+        drop(waiters);
         thread::park();
-        let d = g.lock().unwrap();
-        pred(&d)
+        self.condition_is_ready(guard, &pred)
     }
+
     pub fn signal(&self) {
-        eprintln!("[DBG] enter SyncQueue::signal");
-        let mut q = self.q.lock().unwrap();
-        match q.len() {
-            0 => {self.count.fetch_add(1, Ordering::Relaxed);}
-            1 => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }
-            _ => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }
+        match self.pop_waiter() {
+            Some(waiter) => waiter.unpark(),
+            None => {
+                self.pending_signals.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
+
     pub fn broadcast(&self) {
-        eprintln!("[DBG] enter SyncQueue::broadcast");
-        let mut q = self.q.lock().unwrap();
-        let batch: Vec<thread::Thread> = q.drain(..).collect();
-        drop(q);
-        for t in batch { t.unpark(); }
+        self.wake_all_waiters();
     }
+
     pub fn signal_n(&self, n: usize) -> usize {
-        let mut q = self.q.lock().unwrap();
-        let avail = q.len();
-        let to_wake = if n < avail { n } else { avail };
+        let mut waiters = self.waiters.lock().unwrap();
+        let to_wake = min(n, waiters.len());
         let mut woken = 0;
         for _ in 0..to_wake {
-            match q.pop_front() {
-                Some(t) => { t.unpark(); woken += 1; }
+            match waiters.pop_front() {
+                Some(waiter) => {
+                    waiter.unpark();
+                    woken += 1;
+                }
                 None => break,
             }
         }
         woken
     }
-    pub fn pending(&self) -> usize { let q = self.q.lock().unwrap(); q.len() }
-    pub fn wait_ev<T>(&self, g: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool {
-        loop {
-            { let d = g.lock().unwrap(); if let Some(r) = cond(&d) { return r; } }
-            { let mut q = self.q.lock().unwrap(); q.push_back(thread::current()); }
-            thread::park();
-        }
+
+    pub fn pending(&self) -> usize {
+        self.waiters.lock().unwrap().len()
     }
-    pub fn wait_events<T>(queues: &[&SyncQueue], g: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool {
+
+    pub fn wait_ev<T>(&self, guard: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool {
         loop {
             {
-                let d = g.lock().unwrap();
-                if let Some(r) = cond(&d) { return r; }
+                let data = guard.lock().unwrap();
+                if let Some(result) = cond(&data) { return result; }
             }
-            for wq in queues {
-                let mut q = wq.q.lock().unwrap();
-                q.push_back(thread::current());
+            self.enqueue_current_thread();
+            thread::park();
+        }
+    }
+
+    pub fn wait_events<T>(queues: &[&SyncQueue], guard: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool {
+        loop {
+            {
+                let data = guard.lock().unwrap();
+                if let Some(result) = cond(&data) { return result; }
+            }
+            for queue in queues {
+                queue.enqueue_current_thread();
             }
             thread::park();
         }
     }
-    pub fn wait_guard<T>(&self, g: &Mutex<T>) {
-        { let mut q = self.q.lock().unwrap(); q.push_back(thread::current()); }
-        drop(g.lock().unwrap());
+
+    pub fn wait_guard<T>(&self, guard: &Mutex<T>) {
+        self.enqueue_current_thread();
+        drop(guard.lock().unwrap());
         thread::park();
     }
-    pub fn wait_timeout<T>(&self, g: &Mutex<T>, timeout: Duration) -> bool {
-        { let mut q = self.q.lock().unwrap(); q.push_back(thread::current()); }
-        drop(g.lock().unwrap());
+
+    pub fn wait_timeout<T>(&self, guard: &Mutex<T>, timeout: Duration) -> bool {
+        self.enqueue_current_thread();
+        drop(guard.lock().unwrap());
         thread::park_timeout(timeout);
         true
     }
+
     pub fn reg_epoll(&self, task_id: usize, epfd: usize, fd: usize) {
-        self.eq.lock().unwrap().push_back(RegEp { task_id, epfd, fd });
+        self.epoll_waiters.lock().unwrap().push_back(RegEp { task_id, epfd, fd });
     }
+
     pub fn unreg_epoll(&self, task_id: usize, epfd: usize, fd: usize) -> bool {
-        let mut eql = self.eq.lock().unwrap();
-        for i in 0..eql.len() {
-            if eql[i].task_id == task_id && eql[i].epfd == epfd && eql[i].fd == fd {
-                eql.remove(i);
+        let mut epoll_waiters = self.epoll_waiters.lock().unwrap();
+        for index in 0..epoll_waiters.len() {
+            if epoll_waiters[index].task_id == task_id
+                && epoll_waiters[index].epfd == epfd
+                && epoll_waiters[index].fd == fd
+            {
+                epoll_waiters.remove(index);
                 return true;
             }
         }
@@ -1996,54 +2034,98 @@ pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
 }
 
 impl CircBuf {
-    pub fn new(c: usize) -> Self { Self { data: vec![0u8; c], rd: 0, wr: 0, cap: c, n: 0 } }
-    pub fn with_pos(c: usize, r: usize, w: usize) -> Self {
-        let n = if w >= r { w - r } else { c - r + w };
-        Self { data: vec![0u8; c], rd: r, wr: w, cap: c, n }
-    }
-    pub fn push(&mut self, v: u8) -> bool {
-        self.wr = self.wr.wrapping_add(1);
-        let i = self.wr % self.cap;
-        if self.n >= self.cap {
-            self.wr = self.wr.wrapping_sub(1);
-            return false;
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            data: vec![0u8; capacity],
+            rd: 0,
+            wr: 0,
+            cap: capacity,
+            n: 0,
         }
-        if i >= self.data.len() { self.wr = self.wr.wrapping_sub(1); return false; }
-        self.data[i] = v;
+    }
+
+    pub fn with_pos(capacity: usize, read_pos: usize, write_pos: usize) -> Self {
+        let len = if write_pos >= read_pos {
+            write_pos - read_pos
+        } else {
+            capacity - read_pos + write_pos
+        };
+        Self {
+            data: vec![0u8; capacity],
+            rd: read_pos,
+            wr: write_pos,
+            cap: capacity,
+            n: len,
+        }
+    }
+
+    fn next_write_index(&mut self) -> Option<usize> {
+        if self.n >= self.cap {
+            return None;
+        }
+        self.wr = self.wr.wrapping_add(1);
+        let index = self.wr % self.cap;
+        if index >= self.data.len() {
+            self.wr = self.wr.wrapping_sub(1);
+            None
+        } else {
+            Some(index)
+        }
+    }
+
+    fn next_read_index(&mut self) -> Option<usize> {
+        if self.n == 0 {
+            return None;
+        }
+        self.rd = self.rd.wrapping_add(1);
+        let index = self.rd % self.cap;
+        if index >= self.data.len() {
+            self.rd = self.rd.wrapping_sub(1);
+            None
+        } else {
+            Some(index)
+        }
+    }
+
+    pub fn push(&mut self, byte: u8) -> bool {
+        let index = match self.next_write_index() {
+            Some(index) => index,
+            None => return false,
+        };
+        self.data[index] = byte;
         self.n += 1;
         true
     }
+
     pub fn pop(&mut self) -> Option<u8> {
-        if self.n == 0 { return None; }
-        self.rd = self.rd.wrapping_add(1);
-        let i = self.rd % self.cap;
-        if i >= self.data.len() { self.rd = self.rd.wrapping_sub(1); return None; }
+        let index = self.next_read_index()?;
         self.n -= 1;
-        Some(self.data[i])
+        Some(self.data[index])
     }
+
     pub fn len(&self) -> usize { self.n }
     pub fn empty(&self) -> bool { self.n == 0 }
     pub fn full(&self) -> bool { self.n >= self.cap }
 
     pub fn peek(&self) -> Option<u8> {
         if self.n == 0 { return None; }
-        let i = self.rd.wrapping_add(1) % self.cap;
-        if i >= self.data.len() { return None; }
-        Some(self.data[i])
+        let index = self.rd.wrapping_add(1) % self.cap;
+        if index >= self.data.len() { return None; }
+        Some(self.data[index])
     }
 
     pub fn drain_to(&mut self, dst: &mut Vec<u8>, max: usize) -> usize {
         let take = min(max, self.n);
         for _ in 0..take {
-            if let Some(b) = self.pop() { dst.push(b); }
+            if let Some(byte) = self.pop() { dst.push(byte); }
         }
         take
     }
 
     pub fn fill_from(&mut self, src: &[u8]) -> usize {
         let mut written = 0;
-        for &b in src {
-            if !self.push(b) { break; }
+        for &byte in src {
+            if !self.push(byte) { break; }
             written += 1;
         }
         written
@@ -2956,15 +3038,13 @@ impl Channel {
             }
         };
         if success {
-            let mut wq = self.wq.q.lock().unwrap();
-            if let Some(t) = wq.pop_front() { t.unpark(); }
+            self.wq.wake_one_waiter();
         }
         success
     }
     pub fn close(&self) {
         self.shut.store(true, Ordering::Release);
-        let mut wq = self.wq.q.lock().unwrap();
-        while let Some(t) = wq.pop_front() { t.unpark(); }
+        self.wq.wake_all_waiters();
     }
 
     pub fn try_recv(&self) -> Option<u8> {
@@ -2999,8 +3079,7 @@ impl Channel {
         }
         if written > 0 {
             drop(ring);
-            let mut wq = self.wq.q.lock().unwrap();
-            if let Some(t) = wq.pop_front() { t.unpark(); }
+            self.wq.wake_one_waiter();
         }
         written
     }
