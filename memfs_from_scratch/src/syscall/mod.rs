@@ -23,7 +23,6 @@ impl Kernel {
     }
 
     pub fn sys_open(&mut self, path: &str, create: bool, options: OpenOptions) -> Result<usize> {
-        let _ = (path, create, options);
         // lookup or create inode, wrap it in FileHandle, insert into fd_table.
         //todo!("step 21: implement Kernel::sys_open")
         let inode = match self.lookup(path) {
@@ -34,25 +33,26 @@ impl Kernel {
 
         let file = FileHandle::new(inode, options);
         Ok(self.process.add_file(FileLike::File(file)))
-}
     }
+    
 
     pub fn sys_open_flags(&mut self, path: &str, flags: OpenFlags) -> Result<usize> {
         let _ = (path, flags);
         // translate OpenFlags, call sys_open, then handle TRUNCATE.
         todo!("step 22: implement Kernel::sys_open_flags")
+
     }
 
     pub fn sys_read(&self, fd: usize, buf: &mut [u8]) -> Result<usize> {
-        let _ = (fd, buf);
-        // TODO(you): get FileLike from fd and call read.
-        todo!("step 23: implement Kernel::sys_read")
+        // get FileLike from fd and call read.
+        //todo!("step 23: implement Kernel::sys_read")
+        self.process.get_file_like(fd)?.read(buf)
     }
 
     pub fn sys_write(&self, fd: usize, buf: &[u8]) -> Result<usize> {
-        let _ = (fd, buf);
-        // TODO(you): get FileLike from fd and call write.
-        todo!("step 24: implement Kernel::sys_write")
+        // get FileLike from fd and call write.
+        //todo!("step 24: implement Kernel::sys_write")
+        self.process.get_file_like(fd)?.write(buf)
     }
 
     pub fn sys_close(&mut self, fd: usize) -> Result<()> {
@@ -86,9 +86,10 @@ impl Kernel {
     }
 
     pub fn sys_lseek(&self, fd: usize, offset: usize) -> Result<()> {
-        let _ = (fd, offset);
-        // TODO(you): set file handle offset.
-        todo!("step 30: implement Kernel::sys_lseek")
+        // set file handle offset.
+        //todo!("step 30: implement Kernel::sys_lseek")
+        self.process.get_file_like(fd)?.as_file().seek_set(offset);
+        Ok(())
     }
 
     pub fn sys_getdents(&self, path: &str) -> Result<Vec<String>> {

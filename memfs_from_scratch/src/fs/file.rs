@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 use spin::Mutex;
 
 use crate::fs::{Inode, Metadata};
-use crate::Result;
+use crate::{Error, Result};
 
 bitflags::bitflags! {
     pub struct OpenFlags: u32 {
@@ -83,43 +83,73 @@ impl FileHandle {
     }
 
     pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
-        let _ = buf;
-        // TODO(you): check read permission, read at current offset, update offset.
-        todo!("step 10: implement FileHandle::read")
+       
+        // check read permission, read at current offset, update offset.
+        //todo!("step 10: implement FileHandle::read")
+        if !self.options.read {
+            return Err(Error::Permission);
+        }
+
+        let mut offset = self.offset.lock();
+        let len = self.inode.read_at(*offset, buf)?;
+        *offset += len;
+        Ok(len)
     }
 
     pub fn write(&self, buf: &[u8]) -> Result<usize> {
-        let _ = buf;
-        // TODO(you): check write permission, handle append, write, update offset.
-        todo!("step 11: implement FileHandle::write")
+        // check write permission, handle append, write, update offset.
+        //todo!("step 11: implement FileHandle::write")
+        if !self.options.write {
+            return Err(Error::Permission);
+        }
+
+        let mut offset = self.offset.lock();
+
+        if self.options.append {
+            *offset = self.inode.len();
+        }
+
+        let len = self.inode.write_at(*offset, buf)?;
+        *offset += len;
+        Ok(len)
     }
 
     pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
-        let _ = (offset, buf);
-        // TODO(you): permission-checking wrapper around inode.read_at.
-        todo!("step 12: implement FileHandle::read_at")
+        // permission-checking wrapper around inode.read_at.
+        //todo!("step 12: implement FileHandle::read_at")
+        if !self.options.read {
+            return Err(Error::Permission);
+        }
+        self.inode.read_at(offset, buf)
     }
 
     pub fn write_at(&self, offset: usize, buf: &[u8]) -> Result<usize> {
-        let _ = (offset, buf);
-        // TODO(you): permission-checking wrapper around inode.write_at.
-        todo!("step 13: implement FileHandle::write_at")
+        
+        // permission-checking wrapper around inode.write_at.
+        // todo!("step 13: implement FileHandle::write_at")
+        if !self.options.write {
+            return Err(Error::Permission);
+        }
+        self.inode.write_at(offset, buf)
     }
 
     pub fn metadata(&self) -> Result<Metadata> {
-        // TODO(you): return inode metadata.
-        todo!("step 14: implement FileHandle::metadata")
+        // return inode metadata.
+        // todo!("step 14: implement FileHandle::metadata")
+        Ok(self.inode.metadata())
     }
 
     pub fn seek_set(&self, offset: usize) {
-        let _ = offset;
-        // TODO(you): set this handle's offset.
-        todo!("step 15: implement FileHandle::seek_set")
+        
+        // set this handle's offset.
+        //todo!("step 15: implement FileHandle::seek_set")
+        *self.offset.lock() = offset;
     }
 
     pub fn offset(&self) -> usize {
-        // TODO(you): read this handle's offset.
-        todo!("step 16: implement FileHandle::offset")
+        // read this handle's offset.
+        // todo!("step 16: implement FileHandle::offset")
+        *self.offset.lock()
     }
 }
 
