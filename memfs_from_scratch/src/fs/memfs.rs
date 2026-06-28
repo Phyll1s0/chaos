@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use spin::RwLock;
 
 use crate::fs::{FileType, Inode};
-use crate::Result;
+use crate::{Error, Result};
 
 pub struct MemFS {
     root: Arc<MemInode>,
@@ -60,53 +60,129 @@ impl MemInode {
 
 impl Inode for MemInode {
     fn file_type(&self) -> FileType {
-        // TODO(you): read self.inner and return FileType::File or FileType::Dir.
-        todo!("step 1: implement MemInode::file_type")
+        // read self.inner and return FileType::File or FileType::Dir.
+        //todo!("step 1: implement MemInode::file_type")
+        match &*self.inner.read() {
+            MemInodeInner::File { .. } => FileType::File,
+            MemInodeInner::Dir { .. } => FileType::Dir,
+        }
     }
 
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
-        let _ = (offset, buf);
-        // TODO(you): read bytes from File { data } starting at offset.
-        todo!("step 2: implement MemInode::read_at")
+        //  read bytes from File { data } starting at offset.
+        //todo!("step 2: implement MemInode::read_at")
+        match &*self.inner.read() {
+            MemInodeInner::File { data } => {
+                if offset >= data.len() {
+                    return Ok(0);
+                }
+                let end = core::cmp::min(offset + buf.len(), data.len());
+                let src = &data[offset..end];
+                buf[..src.len()].copy_from_slice(src);
+                Ok(src.len())
+            }
+            MemInodeInner::Dir { .. } => Err(Error::IsDir),
+        }
     }
 
     fn write_at(&self, offset: usize, buf: &[u8]) -> Result<usize> {
         let _ = (offset, buf);
-        // TODO(you): resize File { data } if needed, then copy buf into it.
-        todo!("step 3: implement MemInode::write_at")
+        // resize File { data } if needed, then copy buf into it.
+        //todo!("step 3: implement MemInode::write_at")
+        match &mut *self.inner.write() {
+            MemInodeInner::File { data } => {
+                let end = offset + buf.len();
+                if end > data.len() {
+                    data.resize(end, 0);
+                }
+                data[offset..end].copy_from_slice(buf);
+                Ok(buf.len())
+            }
+            MemInodeInner::Dir { .. } => Err(Error::IsDir),
+        }
     }
 
     fn len(&self) -> usize {
         // TODO(you): return file byte length or directory entry count.
-        todo!("step 4: implement MemInode::len")
+        //todo!("step 4: implement MemInode::len")
+        match &*self.inner.read() {
+            MemInodeInner::File { data } => data.len(),
+            MemInodeInner::Dir { entries } => entries.len(),
+        }
     }
 
     fn resize(&self, len: usize) -> Result<()> {
         let _ = len;
-        // TODO(you): resize regular file contents.
-        todo!("step 5: implement MemInode::resize")
+        // resize regular file contents.
+        // todo!("step 5: implement MemInode::resize")
+        match &mut *self.inner.write() {
+            MemInodeInner::File { data } => {
+                data.resize(len, 0);
+                Ok(())
+            }
+            MemInodeInner::Dir { .. } => Err(Error::IsDir),
+    }
     }
 
     fn find(&self, name: &str) -> Result<Arc<dyn Inode>> {
         let _ = name;
-        // TODO(you): find child inode in a directory.
-        todo!("step 6: implement MemInode::find")
+        // find child inode in a directory.
+        //todo!("step 6: implement MemInode::find")
+        match &*self.inner.read() {
+            MemInodeInner::Dir { entries } => {
+                match entries.get(name) {
+                    Some(inode) => {
+                        let inode: Arc<MemInode> = inode.clone();
+                        let inode: Arc<dyn Inode> = inode;
+                        Ok(inode)
+                    }
+                    None => Err(Error::NotFound),
+                }
+            }
+            MemInodeInner::File { .. } => Err(Error::NotDir),
+        }
     }
 
     fn create(&self, name: &str, file_type: FileType) -> Result<Arc<dyn Inode>> {
         let _ = (name, file_type);
-        // TODO(you): create file or dir inside a directory.
-        todo!("step 7: implement MemInode::create")
+        // create file or dir inside a directory.
+        //todo!("step 7: implement MemInode::create")
+        match &mut *self.inner.write() {
+            MemInodeInner::Dir { entries } => {
+                if entries.contains_key(name) {
+                    return Err(Error::AlreadyExists);
+                }
+
+                let inode = match file_type {
+                    FileType::File => MemInode::new_file(),
+                    FileType::Dir => MemInode::new_dir(),
+                };
+
+                entries.insert(name.to_string(), inode.clone());
+                Ok(inode)
+            }
+            MemInodeInner::File { .. } => Err(Error::NotDir),
+        }
     }
 
     fn unlink(&self, name: &str) -> Result<()> {
         let _ = name;
-        // TODO(you): remove a child name from a directory.
-        todo!("step 8: implement MemInode::unlink")
+        // remove a child name from a directory.
+        //todo!("step 8: implement MemInode::unlink")
+        match &mut *self.inner.write() {
+            MemInodeInner::Dir { entries } => {
+                entries.remove(name).map(|_| ()).ok_or(Error::NotFound)
+            }
+            MemInodeInner::File { .. } => Err(Error::NotDir),
+        }
     }
 
     fn list(&self) -> Result<Vec<String>> {
-        // TODO(you): list directory entry names.
-        todo!("step 9: implement MemInode::list")
+        //  list directory entry names.
+        //todo!("step 9: implement MemInode::list")
+        match &*self.inner.read() {
+            MemInodeInner::Dir { entries } => Ok(entries.keys().cloned().collect()),
+            MemInodeInner::File { .. } => Err(Error::NotDir),
+        }
     }
 }
