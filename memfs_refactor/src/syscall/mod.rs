@@ -73,19 +73,20 @@ impl Kernel {
     }
 
     pub fn sys_mkdir(&self, path: &str) -> Result<()> {
-        let _ = path;
-        // TODO(you): find parent dir and create a dir inode.
-        todo!("step 26: implement Kernel::sys_mkdir")
+        // find parent dir and create a dir inode.
+        //todo!("step 26: implement Kernel::sys_mkdir")
+        let (parent, name) = self.parent_dir(path)?;
+        parent.create(name, FileType::Dir).map(|_| ())
     }
 
     pub fn sys_unlink(&self, path: &str) -> Result<()> {
-        let _ = path;
         // TODO(you): find parent dir and remove child entry.
-        todo!("step 27: implement Kernel::sys_unlink")
+        //todo!("step 27: implement Kernel::sys_unlink")
+        let (parent, name) = self.parent_dir(path)?;
+        parent.unlink(name)
     }
 
     pub fn sys_fstat(&self, fd: usize) -> Result<Metadata> {
-        
         // get file metadata through fd.
         //todo!("step 28: implement Kernel::sys_fstat")
         self.process.get_file_like(fd)?.as_file().metadata()
@@ -106,15 +107,24 @@ impl Kernel {
     }
 
     pub fn sys_getdents(&self, path: &str) -> Result<Vec<String>> {
-        let _ = path;
         // TODO(you): lookup dir inode and list entries.
-        todo!("step 31: implement Kernel::sys_getdents")
+        //todo!("step 31: implement Kernel::sys_getdents")
+        self.lookup(path)?.list()
     }
 
     pub fn sys_chdir(&mut self, path: &str) -> Result<()> {
-        let _ = path;
-        // TODO(you): lookup path, ensure it is a dir, update cwd.
-        todo!("step 32: implement Kernel::sys_chdir")
+        // lookup path, ensure it is a dir, update cwd.
+        //todo!("step 32: implement Kernel::sys_chdir")
+        let inode = self.lookup(path)?;
+
+        if inode.file_type() != FileType::Dir {
+            return Err(Error::NotDir);
+        }
+
+        let abs = self.absolute_path(path);
+        self.process.set_cwd(abs);
+
+        Ok(())
     }
 
     fn lookup(&self, path: &str) -> Result<Arc<dyn Inode>> {
@@ -163,9 +173,21 @@ impl Kernel {
     }
 
     fn parent_dir<'a>(&self, path: &'a str) -> Result<(Arc<dyn Inode>, &'a str)> {
-        let _ = path;
         // split parent path, lookup parent, ensure it is a directory.
-        todo!("step 35: implement Kernel::parent_dir")
+        //todo!("step 35: implement Kernel::parent_dir")
+        let (parent_path, name) = split_parent(path);
+
+        if name.is_empty() || name == "." || name == ".." {
+            return Err(Error::Invalid);
+        }
+
+        let parent = self.lookup(parent_path)?;
+
+        if parent.file_type() != FileType::Dir {
+            return Err(Error::NotDir);
+        }
+
+        Ok((parent, name))
     }
 
     fn absolute_path(&self, path: &str) -> String {
