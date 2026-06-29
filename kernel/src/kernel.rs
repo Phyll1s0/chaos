@@ -1493,7 +1493,13 @@ impl Drop for KStk {
 
 // check_access: Check whether a user address range stays below kernel space.
 pub fn check_access(addr: usize, len: usize) -> bool {
-    addr.wrapping_add(len) < KERN_BASE && addr.wrapping_add(len) >= addr 
+    if len == 0 {
+        return addr < KERN_BASE;
+    }
+    match addr.checked_add(len) {
+        Some(end) => addr < KERN_BASE && end <= KERN_BASE,
+        None => false,
+    }
 }
 
 // check_access_rw: Check whether a writable user address range is valid.
@@ -3090,21 +3096,30 @@ impl BlockCache {
             chain.release();
             return Some(data);
         }
+        chain.release();
 
         let tick_before = CLK.load(Ordering::Relaxed);
         if latency.as_nanos() > 0 { thread::sleep(latency); }
 
         let block_data = Self::synthetic_block(block_id, tick_before);
-        let result = block_data.clone();
-        let slot = CacheSlot {
-            id: block_id,
-            payload: block_data,
-            modified: false,
-        };
-        {
+
+        chain.acquire();
+
+        let result = {
             let mut items = chain.items.lock().unwrap();
-            items.push(slot);
-        }
+
+            if let Some(existing) = items.iter().find(|slot| slot.id == block_id) {
+                existing.payload.clone()
+            } else {
+                items.push(CacheSlot {
+                    id: block_id,
+                    payload: block_data.clone(),
+                    modified: false,
+                });
+
+                block_data
+            }
+        };
         chain.release();
         Some(result)
     }
@@ -4373,6 +4388,10 @@ impl TrapCtl {
                 if hw & 0x02 != 0 { return self.dispatch(ctx); }
                 ctx
             }
+            14 => {
+                let _ = self.on_pgfault(0);
+                self.dispatch(ctx)
+            }//fix
             2..=7 => {
                 if hw & (1 << vector) != 0 { return self.dispatch(ctx); }
                 ctx
@@ -4381,10 +4400,6 @@ impl TrapCtl {
                 let sw_bit = vector - 8;
                 if sw & (1 << sw_bit) != 0 { return self.dispatch(ctx); }
                 ctx
-            }
-            14 => {
-                let _ = self.on_pgfault(0);
-                self.dispatch(ctx)
             }
             _ => ctx,
         }
