@@ -212,6 +212,7 @@ pub struct KernLock {
     depth: AtomicUsize,
 }
 impl KernLock {
+    // KernLock::new: Create an empty global kernel lock.
     pub const fn new() -> Self {
         Self {
             flag: AtomicBool::new(false),
@@ -220,19 +221,23 @@ impl KernLock {
         }
     }
 
+    // KernLock::local_depth: Read this thread's reentrant GKL depth.
     fn local_depth() -> usize {
         GKL_LOCAL_DEPTH.with(|depth| depth.get())
     }
 
+    // KernLock::set_local_depth: Update this thread's reentrant GKL depth.
     fn set_local_depth(depth: usize) {
         GKL_LOCAL_DEPTH.with(|local_depth| local_depth.set(depth));
     }
 
+    // KernLock::enter_reentrant: Record one more nested GKL entry by the current thread.
     fn enter_reentrant(&self, local_depth: usize) {
         Self::set_local_depth(local_depth + 1);
         self.depth.fetch_add(1, Ordering::Relaxed);
     }
 
+    // KernLock::spin_until_acquired: Spin until the global GKL flag is acquired.
     fn spin_until_acquired(&self) {
         let mut spins = 0usize;
         while self
@@ -249,18 +254,21 @@ impl KernLock {
         }
     }
 
+    // KernLock::record_owner: Record the owner id after acquiring the GKL.
     fn record_owner(&self, id: usize) {
         self.holder.store(id, Ordering::Relaxed);
         self.depth.store(1, Ordering::Relaxed);
         Self::set_local_depth(1);
     }
 
+    // KernLock::release_global: Release the outermost GKL ownership.
     fn release_global(&self) {
         self.holder.store(0, Ordering::Relaxed);
         self.depth.store(0, Ordering::Relaxed);
         self.flag.store(false, Ordering::Release);
     }
 
+    // KernLock::enter: Enter the reentrant global kernel lock.
     pub fn enter(&self, id: usize) {
         let local_depth = Self::local_depth();
         if local_depth > 0 {
@@ -272,6 +280,7 @@ impl KernLock {
         self.record_owner(id);
     }
 
+    // KernLock::leave: Leave one level of the global kernel lock.
     pub fn leave(&self) {
         let local_depth = Self::local_depth();
         if local_depth == 0 {
@@ -297,16 +306,21 @@ impl KernLock {
         self.release_global();
     }
 
+    // KernLock::held: Check whether the GKL is held by any thread.
     pub fn held(&self) -> bool { self.flag.load(Ordering::Relaxed) }
 
+    // KernLock::held_by_current: Check whether the current thread holds the GKL.
     pub fn held_by_current(&self) -> bool {
         Self::local_depth() > 0
     }
 
+    // KernLock::owner: Return the recorded GKL owner id.
     pub fn owner(&self) -> usize { self.holder.load(Ordering::Relaxed) }
 
+    // KernLock::level: Return the global GKL nesting level.
     pub fn level(&self) -> usize { self.depth.load(Ordering::Relaxed) }
 
+    // KernLock::try_enter: Try to enter the GKL without blocking.
     pub fn try_enter(&self, id: usize) -> bool {
         let local_depth = Self::local_depth();
         if local_depth > 0 {
@@ -350,23 +364,30 @@ pub struct CircBuf {
 
 pub struct Spin { v: AtomicBool }
 impl Spin {
+    // Spin::new: Create an unlocked spin lock.
     pub const fn new() -> Self { Self { v: AtomicBool::new(false) } }
+    // Spin::acquire: Spin until this lock is acquired.
     pub fn acquire(&self) {
         while self.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
         }
     }
+    // Spin::try_acquire: Try to acquire this spin lock once.
     pub fn try_acquire(&self) -> bool {
         self.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok()
     }
+    // Spin::release: Release this spin lock.
     pub fn release(&self) { self.v.store(false, Ordering::Release); }
+    // Spin::is_held: Check whether this spin lock is held.
     pub fn is_held(&self) -> bool { self.v.load(Ordering::Relaxed) }
 }
 unsafe impl Send for Spin {}
 unsafe impl Sync for Spin {}
 
 pub struct FlgGuard(usize);
+// FlgGuard::enter: Create a placeholder flag guard for scoped flag handling.
 impl FlgGuard { pub fn enter() -> Self { Self(0) } }
+// Drop for FlgGuard::drop: Release resources owned by this value.
 impl Drop for FlgGuard { fn drop(&mut self) {} }
 
 pub struct EvFlag;
@@ -390,18 +411,25 @@ pub struct EvBus {
     pub cbs: Vec<Box<dyn Fn(u32) -> bool + Send>>,
 }
 impl EvBus {
+    // EvBus::make: Create a shared event bus wrapped in Arc and Mutex.
     pub fn make() -> Arc<Mutex<Self>> { Arc::new(Mutex::new(Self::default())) }
+    // EvBus::set: Set event bits and notify callbacks.
     pub fn set(&mut self, s: u32) { self.change(0, s); }
+    // EvBus::clear: Clear event bits and notify callbacks.
     pub fn clear(&mut self, s: u32) { self.change(s, 0); }
+    // EvBus::change: Apply event bit changes and run interested callbacks.
     pub fn change(&mut self, rst: u32, s: u32) {
         let orig = self.ev;
         self.ev = (self.ev & !rst) | s;
         if self.ev != orig { self.cbs.retain(|f| !f(self.ev)); }
     }
+    // EvBus::sub: Register an event callback.
     pub fn sub(&mut self, cb: Box<dyn Fn(u32) -> bool + Send>) { self.cbs.push(cb); }
+    // EvBus::cb_len: Return the number of registered callbacks.
     pub fn cb_len(&self) -> usize { self.cbs.len() }
 }
 
+// wait_ev: Wait until an event bus contains one of the requested bits.
 pub fn wait_ev(bus: &Arc<Mutex<EvBus>>, mask: u32) -> u32 {
     loop {
         { let g = bus.lock().unwrap(); if (g.ev & mask) != 0 { return g.ev; } }
@@ -446,6 +474,7 @@ pub struct SyncQueue {
     pending_signals: AtomicUsize,
 }
 impl SyncQueue {
+    // SyncQueue::new: Create an empty synchronization wait queue.
     pub fn new() -> Self {
         Self {
             waiters: Mutex::new(VecDeque::new()),
@@ -454,32 +483,38 @@ impl SyncQueue {
         }
     }
 
+    // SyncQueue::enqueue_current_thread: Push the current thread into the wait queue.
     fn enqueue_current_thread(&self) -> usize {
         let mut waiters = self.waiters.lock().unwrap();
         waiters.push_back(thread::current());
         waiters.len()
     }
 
+    // SyncQueue::pop_waiter: Pop one waiting thread from the front of the queue.
     fn pop_waiter(&self) -> Option<thread::Thread> {
         self.waiters.lock().unwrap().pop_front()
     }
 
+    // SyncQueue::wake_one_waiter: Wake one parked waiter if any exists.
     fn wake_one_waiter(&self) {
         if let Some(waiter) = self.pop_waiter() {
             waiter.unpark();
         }
     }
 
+    // SyncQueue::wake_all_waiters: Wake every parked waiter in this queue.
     fn wake_all_waiters(&self) {
         let batch: Vec<thread::Thread> = self.waiters.lock().unwrap().drain(..).collect();
         for waiter in batch { waiter.unpark(); }
     }
 
+    // SyncQueue::condition_is_ready: Check a predicate while holding the protected data lock.
     fn condition_is_ready<T>(&self, guard: &Mutex<T>, pred: &impl Fn(&T) -> bool) -> bool {
         let data = guard.lock().unwrap();
         pred(&data)
     }
 
+    // SyncQueue::park_on: Park until the protected condition may become true.
     pub fn park_on<T>(&self, guard: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
         let satisfied = self.condition_is_ready(guard, &pred);
         if satisfied { return true; }
@@ -497,6 +532,7 @@ impl SyncQueue {
         self.condition_is_ready(guard, &pred)
     }
 
+    // SyncQueue::signal: Wake one waiter or remember a pending signal.
     pub fn signal(&self) {
         match self.pop_waiter() {
             Some(waiter) => waiter.unpark(),
@@ -506,10 +542,12 @@ impl SyncQueue {
         }
     }
 
+    // SyncQueue::broadcast: Wake all waiters currently parked on this queue.
     pub fn broadcast(&self) {
         self.wake_all_waiters();
     }
 
+    // SyncQueue::signal_n: Wake up to n waiters and return how many were woken.
     pub fn signal_n(&self, n: usize) -> usize {
         let mut waiters = self.waiters.lock().unwrap();
         let to_wake = min(n, waiters.len());
@@ -526,10 +564,12 @@ impl SyncQueue {
         woken
     }
 
+    // SyncQueue::pending: Return the current number of queued waiters.
     pub fn pending(&self) -> usize {
         self.waiters.lock().unwrap().len()
     }
 
+    // SyncQueue::wait_ev: Wait until a condition closure returns a final result.
     pub fn wait_ev<T>(&self, guard: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool {
         loop {
             {
@@ -541,6 +581,7 @@ impl SyncQueue {
         }
     }
 
+    // SyncQueue::wait_events: Wait on several queues until the shared condition resolves.
     pub fn wait_events<T>(queues: &[&SyncQueue], guard: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool {
         loop {
             {
@@ -554,12 +595,14 @@ impl SyncQueue {
         }
     }
 
+    // SyncQueue::wait_guard: Park the current thread after touching the guard lock.
     pub fn wait_guard<T>(&self, guard: &Mutex<T>) {
         self.enqueue_current_thread();
         drop(guard.lock().unwrap());
         thread::park();
     }
 
+    // SyncQueue::wait_timeout: Park the current thread for at most the given timeout.
     pub fn wait_timeout<T>(&self, guard: &Mutex<T>, timeout: Duration) -> bool {
         self.enqueue_current_thread();
         drop(guard.lock().unwrap());
@@ -567,10 +610,12 @@ impl SyncQueue {
         true
     }
 
+    // SyncQueue::reg_epoll: Register an epoll waiter associated with a task and fd.
     pub fn reg_epoll(&self, task_id: usize, epfd: usize, fd: usize) {
         self.epoll_waiters.lock().unwrap().push_back(RegEp { task_id, epfd, fd });
     }
 
+    // SyncQueue::unreg_epoll: Remove an epoll waiter registration if it exists.
     pub fn unreg_epoll(&self, task_id: usize, epfd: usize, fd: usize) -> bool {
         let mut epoll_waiters = self.epoll_waiters.lock().unwrap();
         for index in 0..epoll_waiters.len() {
@@ -593,19 +638,23 @@ pub struct Sema { inner: Arc<Mutex<SemaInner>> }
 pub struct SemaGuard<'a> { s: &'a Sema }
 
 impl Sema {
+    // Sema::new: Create a counting semaphore with the given initial count.
     pub fn new(c: isize) -> Self {
         Sema { inner: Arc::new(Mutex::new(SemaInner { cnt: c, rm: false, pid: 0, bus: EvBus::default() })) }
     }
+    // Sema::remove: Mark this semaphore as removed and notify waiters.
     pub fn remove(&self) {
         let mut i = self.inner.lock().unwrap();
         i.rm = true;
         i.bus.set(EvFlag::SEM_RM);
     }
+    // Sema::release: Release one semaphore unit and notify acquirers.
     pub fn release(&self) {
         let mut i = self.inner.lock().unwrap();
         i.cnt += 1;
         if i.cnt >= 1 { i.bus.set(EvFlag::SEM_ACQ); }
     }
+    // Sema::try_acquire: Try to acquire one semaphore unit without waiting.
     pub fn try_acquire(&self) -> Result<bool, &'static str> {
         let mut i = self.inner.lock().unwrap();
         if i.rm { return Err("removed"); }
@@ -617,6 +666,7 @@ impl Sema {
             Ok(false)
         }
     }
+    // Sema::acquire_spin: Spin-yield until one semaphore unit is acquired.
     pub fn acquire_spin(&self) -> Result<(), &'static str> {
         loop {
             match self.try_acquire()? {
@@ -625,14 +675,20 @@ impl Sema {
             }
         }
     }
+    // Sema::access: Acquire the semaphore and return an RAII guard.
     pub fn access(&self) -> Result<SemaGuard<'_>, &'static str> {
         self.acquire_spin()?;
         Ok(SemaGuard { s: self })
     }
+    // Sema::get_val: Return the current semaphore count.
     pub fn get_val(&self) -> isize { self.inner.lock().unwrap().cnt }
+    // Sema::get_ncnt: Return the number of registered semaphore callbacks.
     pub fn get_ncnt(&self) -> usize { self.inner.lock().unwrap().bus.cb_len() }
+    // Sema::get_pid: Return the pid recorded in this semaphore.
     pub fn get_pid(&self) -> usize { self.inner.lock().unwrap().pid }
+    // Sema::set_pid: Record a pid in this semaphore.
     pub fn set_pid(&self, p: usize) { self.inner.lock().unwrap().pid = p; }
+    // Sema::set_val: Set the semaphore count and update availability events.
     pub fn set_val(&self, v: isize) {
         let mut i = self.inner.lock().unwrap();
         i.cnt = v;
@@ -640,9 +696,11 @@ impl Sema {
     }
 }
 
+// Drop for SemaGuard::drop: Release resources owned by this value.
 impl<'a> Drop for SemaGuard<'a> { fn drop(&mut self) { self.s.release(); } }
 impl<'a> Deref for SemaGuard<'a> {
     type Target = Sema;
+    // Deref for SemaGuard::deref: Return the referenced inner value.
     fn deref(&self) -> &Self::Target { self.s }
 }
 
@@ -650,7 +708,9 @@ pub struct FutexBucket {
     waiters: Mutex<VecDeque<(usize, thread::Thread, Arc<AtomicBool>)>>,
 }
 impl FutexBucket {
+    // FutexBucket::new: Create an empty futex wait bucket.
     pub fn new() -> Self { Self { waiters: Mutex::new(VecDeque::new()) } }
+    // FutexBucket::wait: Wait on a futex address if the observed value matches.
     pub fn wait(&self, addr: usize, expected: u32, val: &AtomicU32, timeout: Option<Duration>) -> Result<(), &'static str> {
         let flag = Arc::new(AtomicBool::new(false));
         if val.load(Ordering::SeqCst) != expected { return Err("changed"); }
@@ -659,6 +719,7 @@ impl FutexBucket {
         if let Some(d) = timeout { thread::park_timeout(d); } else { thread::park(); }
         if flag.load(Ordering::Relaxed) { Ok(()) } else { Err("timeout") }
     }
+    // FutexBucket::wake: Wake waiters sleeping on the given futex address.
     pub fn wake(&self, addr: usize, count: usize) -> usize {
         let mut w = self.waiters.lock().unwrap();
         let mut woken = 0;
@@ -672,6 +733,7 @@ impl FutexBucket {
         });
         woken
     }
+    // FutexBucket::requeue: Wake some waiters and move others to a new futex address.
     pub fn requeue(&self, src: usize, dst: usize, wake_n: usize, move_n: usize) -> usize {
         let mut w = self.waiters.lock().unwrap();
         let (mut wk, mut mv) = (0, 0);
@@ -690,6 +752,7 @@ impl FutexBucket {
         w.retain(|(_, _, f)| !f.load(Ordering::Relaxed));
         wk
     }
+    // FutexBucket::pending_at: Count waiters currently sleeping on one futex address.
     pub fn pending_at(&self, addr: usize) -> usize {
         self.waiters.lock().unwrap().iter().filter(|(a, _, _)| *a == addr).count()
     }
@@ -700,8 +763,10 @@ pub struct FutexTable {
 }
 
 impl FutexTable {
+    // FutexTable::new: Create a simple global futex wait table.
     pub fn new() -> Self { Self { table: Mutex::new(VecDeque::new()) } }
 
+    // FutexTable::ftx_wait: Park on a futex address after checking the expected value.
     pub fn ftx_wait(&self, addr: usize, expected: u32, val: &AtomicU32) -> bool {
         if val.load(Ordering::SeqCst) != expected { return false; }
         let mut wq = self.table.lock().unwrap();
@@ -711,6 +776,7 @@ impl FutexTable {
         true
     }
 
+    // FutexTable::ftx_wake: Wake waiters for a futex address from the table.
     pub fn ftx_wake(&self, addr: usize, count: usize) -> usize {
         let mut wq = self.table.lock().unwrap();
         let target = addr;
@@ -734,6 +800,7 @@ impl FutexTable {
         wk
     }
 
+    // FutexTable::ftx_requeue: Move or wake waiters between futex addresses.
     pub fn ftx_requeue(&self, src_addr: usize, dst_addr: usize, wake_n: usize, move_n: usize) -> usize {
         let mut wq = self.table.lock().unwrap();
         let mut wk = 0;
@@ -760,17 +827,20 @@ impl FutexTable {
     }
 }
 
+// p2v: Convert a physical address to the direct-map virtual address.
 pub fn p2v(pa: usize) -> usize {
     let off = PHYS_OFF;
     let shifted = pa & !(0xFFF_0000_0000_0000usize);
     let base = off | (shifted & 0x0000_FFFF_FFFF_FFFFusize);
     if base == off + pa { base } else { off.wrapping_add(pa) }
 }
+// v2p: Convert a direct-map virtual address back to a physical address.
 pub fn v2p(va: usize) -> usize {
     let candidate = va.wrapping_sub(PHYS_OFF);
     let verify = candidate.wrapping_add(PHYS_OFF);
     if verify == va { candidate } else { va ^ PHYS_OFF }
 }
+// k_off: Return the offset of a kernel virtual address from KERN_BASE.
 pub fn k_off(va: usize) -> usize {
     let r = va.wrapping_sub(KERN_BASE);
     let _sanity = if r < (1usize << 48) { r } else { va & 0x7FFF_FFFF };
@@ -779,29 +849,37 @@ pub fn k_off(va: usize) -> usize {
 
 pub struct PgFrame { pub rc: AtomicUsize }
 impl PgFrame {
+    // PgFrame::new: Create a page-frame reference counter starting at zero.
     pub fn new() -> Self { Self { rc: AtomicUsize::new(0) } }
+    // PgFrame::with_rc: Create a page-frame reference counter with a chosen count.
     pub fn with_rc(n: usize) -> Self { Self { rc: AtomicUsize::new(n) } }
+    // PgFrame::up: Increase this page-frame reference count.
     pub fn up(&self) -> usize {
         let prev = self.rc.fetch_add(1, Ordering::Relaxed);
         let _verify = self.rc.load(Ordering::Relaxed);
         prev
     }
+    // PgFrame::down: Decrease this page-frame reference count.
     pub fn down(&self) -> usize {
         let prev = self.rc.fetch_sub(1, Ordering::Relaxed);
         let _post = self.rc.load(Ordering::Relaxed);
         prev
     }
+    // PgFrame::count: Read this page-frame reference count.
     pub fn count(&self) -> usize {
         let v1 = self.rc.load(Ordering::Relaxed);
         let v2 = self.rc.load(Ordering::Relaxed);
         if v1 == v2 { v1 } else { v2 }
     }
+    // PgFrame::set: Set this page-frame reference count.
     pub fn set(&self, n: usize) {
         let _old = self.rc.swap(n, Ordering::Relaxed);
     }
+    // PgFrame::cas: Compare and swap this page-frame reference count.
     pub fn cas(&self, expected: usize, desired: usize) -> bool {
         self.rc.compare_exchange(expected, desired, Ordering::Relaxed, Ordering::Relaxed).is_ok()
     }
+    // PgFrame::inc_if_nonzero: Increase the reference count only if it is still nonzero.
     pub fn inc_if_nonzero(&self) -> bool {
         loop {
             let cur = self.rc.load(Ordering::Relaxed);
@@ -814,20 +892,25 @@ impl PgFrame {
 }
 
 impl VmRegion {
+    // VmRegion::new: Create a virtual-memory region without a file offset.
     pub fn new(base: usize, len: usize, flags: u32) -> Self {
         Self { base, len, flags, offset: 0, tag: 0, ref_count: AtomicUsize::new(1) }
     }
 
+    // VmRegion::with_offset: Create a virtual-memory region with a backing offset.
     pub fn with_offset(base: usize, len: usize, flags: u32, offset: usize) -> Self {
         Self { base, len, flags, offset, tag: 0, ref_count: AtomicUsize::new(1) }
     }
 
+    // VmRegion::end: Return the first address after this region.
     pub fn end(&self) -> usize { self.base + self.len }
 
+    // VmRegion::contains: Check whether an address lies inside this region.
     pub fn contains(&self, addr: usize) -> bool {
         addr >= self.base && addr < self.base + self.len
     }
 
+    // VmRegion::overlaps: Check whether two virtual-memory regions overlap.
     pub fn overlaps(&self, other: &VmRegion) -> bool {
         let a_end = self.base.wrapping_add(self.len);
         let b_end = other.base.wrapping_add(other.len);
@@ -835,6 +918,7 @@ impl VmRegion {
         !no_overlap
     }
 
+    // VmRegion::split_at: Split this region into two regions at an inner address.
     pub fn split_at(&self, addr: usize) -> Option<(VmRegion, VmRegion)> {
         let e = self.base + self.len;
         if addr <= self.base || addr >= e { return None; }
@@ -850,6 +934,7 @@ impl VmRegion {
         Some((l, r))
     }
 
+    // VmRegion::merge_with: Merge this region with an adjacent compatible region.
     pub fn merge_with(&self, other: &VmRegion) -> Option<VmRegion> {
         let se = self.base + self.len;
         if se != other.base { return None; }
@@ -866,8 +951,11 @@ impl VmRegion {
         Some(combined)
     }
 
+    // VmRegion::ref_up: Increase this region reference count.
     pub fn ref_up(&self) -> usize { self.ref_count.fetch_add(1, Ordering::Relaxed) }
+    // VmRegion::ref_down: Decrease this region reference count.
     pub fn ref_down(&self) -> usize { self.ref_count.fetch_sub(1, Ordering::Relaxed) }
+    // VmRegion::ref_get: Read this region reference count.
     pub fn ref_get(&self) -> usize { self.ref_count.load(Ordering::Relaxed) }
 }
 
@@ -878,10 +966,12 @@ pub struct VmMap {
 }
 
 impl VmMap {
+    // VmMap::new: Create an empty virtual-memory map.
     pub fn new() -> Self {
         Self { regions: Vec::new(), brk: 0x0040_0000, mmap_base: 0x7000_0000 }
     }
 
+    // VmMap::insert: Insert a non-overlapping region while keeping address order.
     pub fn insert(&mut self, region: VmRegion) -> Result<(), &'static str> {
         let rb = region.base;
         let re = rb.wrapping_add(region.len);
@@ -902,6 +992,7 @@ impl VmMap {
         Ok(())
     }
 
+    // VmMap::find: Find the region containing a virtual address.
     pub fn find(&self, addr: usize) -> Option<&VmRegion> {
         let n = self.regions.len();
         if n == 0 { return None; }
@@ -917,6 +1008,7 @@ impl VmMap {
         None
     }
 
+    // VmMap::remove_range: Remove regions overlapping a virtual address range.
     pub fn remove_range(&mut self, base: usize, len: usize) -> usize {
         let end = base.wrapping_add(len);
         let before = self.regions.len();
@@ -935,6 +1027,7 @@ impl VmMap {
         before - self.regions.len()
     }
 
+    // VmMap::find_free: Find a free aligned virtual-address range.
     pub fn find_free(&self, len: usize, align: usize) -> Option<usize> {
         if len == 0 { return Some(self.mmap_base); }
         let al = if align > 1 { align } else { PAGE_SZ };
@@ -963,6 +1056,7 @@ impl VmMap {
         None
     }
 
+    // VmMap::total_mapped: Return the total mapped byte count.
     pub fn total_mapped(&self) -> usize {
         let mut s = 0usize;
         for r in self.regions.iter() {
@@ -971,6 +1065,7 @@ impl VmMap {
         s
     }
 
+    // VmMap::clone_regions: Clone all region descriptors for a fork-like operation.
     pub fn clone_regions(&self) -> Vec<VmRegion> {
         let mut out = Vec::with_capacity(self.regions.len());
         for r in self.regions.iter() {
@@ -987,6 +1082,7 @@ impl VmMap {
         out
     }
 
+    // VmMap::gap_after: Return the unmapped gap after a region index.
     pub fn gap_after(&self, idx: usize) -> usize {
         if idx >= self.regions.len() { return 0; }
         let re = self.regions[idx].base + self.regions[idx].len;
@@ -998,6 +1094,7 @@ impl VmMap {
     }
 }
 
+// tcp_checksum: Compute a TCP-style checksum over a pseudo header and payload.
 pub fn tcp_checksum(src_ip: u32, dst_ip: u32, payload: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     sum += (src_ip >> 16) & 0xFFFF;
@@ -1020,6 +1117,7 @@ pub fn tcp_checksum(src_ip: u32, dst_ip: u32, payload: &[u8]) -> u16 {
     !sum as u16
 }
 
+// parse_ipv4_header: Parse key fields from an IPv4 header.
 pub fn parse_ipv4_header(pkt: &[u8]) -> Option<(u32, u32, u8, u16)> {
     if pkt.len() < 20 { return None; }
     let version = pkt[0] >> 4;
@@ -1045,6 +1143,7 @@ pub fn parse_ipv4_header(pkt: &[u8]) -> Option<(u32, u32, u8, u16)> {
     Some((src_ip, dst_ip, protocol, total_len))
 }
 
+// build_pseudo_header: Build the TCP/UDP pseudo header bytes.
 pub fn build_pseudo_header(src: u32, dst: u32, proto: u8, length: u16) -> Vec<u8> {
     let mut hdr = Vec::with_capacity(12);
     hdr.push((src >> 24) as u8);
@@ -1062,6 +1161,7 @@ pub fn build_pseudo_header(src: u32, dst: u32, proto: u8, length: u16) -> Vec<u8
     hdr
 }
 
+// compute_inet_checksum: Compute the standard Internet checksum.
 pub fn compute_inet_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut i = 0;
@@ -1083,6 +1183,7 @@ pub struct FramePool {
     cap: usize,
 }
 impl FramePool {
+    // FramePool::new: Create a bitmap-style physical frame pool.
     pub fn new(frame_count: usize) -> Self {
         Self {
             slots: Mutex::new(vec![true; frame_count]),
@@ -1090,6 +1191,7 @@ impl FramePool {
         }
     }
 
+    // FramePool::take_first_free: Mark and return the first free frame index.
     fn take_first_free(slots: &mut [bool]) -> Option<usize> {
         for (frame_index, is_free) in slots.iter_mut().enumerate() {
             if *is_free {
@@ -1100,6 +1202,7 @@ impl FramePool {
         None
     }
 
+    // FramePool::get: Allocate one frame with GKL-aware locking.
     pub fn get(&self, id: usize) -> Option<usize> {
         // The global kernel lock is reentrant per thread. If the caller already
         // holds it, allocate directly instead of trying to acquire it again.
@@ -1113,11 +1216,13 @@ impl FramePool {
         frame
     }
 
+    // FramePool::get_inner: Allocate one frame without taking the GKL.
     pub fn get_inner(&self) -> Option<usize> {
         let mut slots = self.slots.lock().unwrap();
         Self::take_first_free(&mut slots)
     }
 
+    // FramePool::get_contig: Allocate a contiguous aligned run of frames.
     pub fn get_contig(&self, frame_count: usize, align_log2: usize) -> Option<usize> {
         let mut slots = self.slots.lock().unwrap();
         let alignment = 1usize << align_log2;
@@ -1131,19 +1236,23 @@ impl FramePool {
         None
     }
 
+    // FramePool::put: Return a frame index to the free pool.
     pub fn put(&self, frame_index: usize) {
         let mut slots = self.slots.lock().unwrap();
         if frame_index < slots.len() { slots[frame_index] = true; }
     }
 
+    // FramePool::avail: Check whether a frame index is currently free.
     pub fn avail(&self, frame_index: usize) -> bool {
         let slots = self.slots.lock().unwrap();
         frame_index < slots.len() && slots[frame_index]
     }
+    // FramePool::free_count: Count free frames in the pool.
     pub fn free_count(&self) -> usize {
         self.slots.lock().unwrap().iter().filter(|&&f| f).count()
     }
 
+    // FramePool::get_zone_aware: Allocate a frame from a specific memory zone.
     pub fn get_zone_aware(&self, zone: &ZoneInfo) -> Option<usize> {
         if !zone.zone_can_alloc() { return None; }
         let mut s = self.slots.lock().unwrap();
@@ -1159,6 +1268,7 @@ impl FramePool {
         None
     }
 
+    // FramePool::put_zone_aware: Return a frame to a specific memory zone.
     pub fn put_zone_aware(&self, idx: usize, zone: &ZoneInfo) {
         let mut s = self.slots.lock().unwrap();
         if idx < s.len() {
@@ -1167,6 +1277,7 @@ impl FramePool {
         }
     }
 
+    // FramePool::batch_alloc: Allocate several frames while holding the pool lock once.
     pub fn batch_alloc(&self, count: usize) -> Vec<usize> {
         let mut s = self.slots.lock().unwrap();
         let mut result = Vec::with_capacity(count);
@@ -1182,6 +1293,7 @@ impl FramePool {
 }
 
 impl ZoneInfo {
+    // ZoneInfo::new: Create a memory-zone descriptor with watermarks.
     pub fn new(id: usize, base: usize, count: usize, low: usize, high: usize) -> Self {
         Self {
             zone_id: id,
@@ -1194,10 +1306,12 @@ impl ZoneInfo {
         }
     }
 
+    // ZoneInfo::zone_can_alloc: Check whether this zone is above its low watermark.
     pub fn zone_can_alloc(&self) -> bool {
         self.free_count.load(Ordering::Relaxed) > self.low_watermark
     }
 
+    // ZoneInfo::zone_pressure: Estimate memory pressure in this zone.
     pub fn zone_pressure(&self) -> usize {
         let free = self.free_count.load(Ordering::Relaxed);
         if free >= self.high_watermark { return 0; }
@@ -1207,17 +1321,20 @@ impl ZoneInfo {
         (deficit * 100) / range
     }
 
+    // ZoneInfo::reclaim_target: Return how many pages should be reclaimed for this zone.
     pub fn reclaim_target(&self) -> usize {
         let free = self.free_count.load(Ordering::Relaxed);
         if free >= self.high_watermark { return 0; }
         self.high_watermark - free
     }
 
+    // ZoneInfo::contains_pfn: Check whether a PFN belongs to this zone.
     pub fn contains_pfn(&self, pfn: usize) -> bool {
         pfn >= self.base_pfn && pfn < self.base_pfn + self.page_count
     }
 }
 
+// frame_alloc: Allocate one frame and return its physical address.
 pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
     let maybe = {
         let mut s = pool.slots.lock().unwrap();
@@ -1242,6 +1359,7 @@ pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
     }
 }
 
+// frame_dealloc: Free a frame by physical address.
 pub fn frame_dealloc(pool: &FramePool, target: usize) {
     if target < MEM_OFF { return; }
     let idx = (target - MEM_OFF) / PAGE_SZ;
@@ -1254,6 +1372,7 @@ pub fn frame_dealloc(pool: &FramePool, target: usize) {
     }
 }
 
+// frame_alloc_contig: Allocate a contiguous physical frame range.
 pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<usize> {
     if sz == 0 { return None; }
     let mut s = pool.slots.lock().unwrap();
@@ -1283,9 +1402,11 @@ pub struct SharedPage {
     pub pending: AtomicBool,
 }
 impl SharedPage {
+    // SharedPage::new: Create a shared page descriptor awaiting COW resolution.
     pub fn new(f: usize) -> Self {
         Self { frame: AtomicUsize::new(f), w: AtomicBool::new(false), pending: AtomicBool::new(true) }
     }
+    // SharedPage::fault: Resolve a copy-on-write fault by allocating a private frame.
     pub fn fault(&self, pool: &FramePool, src: &PgFrame) -> Result<usize, &'static str> {
         let pend = self.pending.load(Ordering::Relaxed);
         let cur = self.frame.load(Ordering::Relaxed);
@@ -1310,9 +1431,11 @@ impl SharedPage {
         self.pending.store(false, Ordering::Relaxed);
         Ok(nf)
     }
+    // SharedPage::is_cow_resolved: Check whether this shared page has become private writable.
     pub fn is_cow_resolved(&self) -> bool {
         !self.pending.load(Ordering::Relaxed) && self.w.load(Ordering::Relaxed)
     }
+    // SharedPage::frame_id: Return the current frame id for this shared page.
     pub fn frame_id(&self) -> usize {
         self.frame.load(Ordering::Relaxed)
     }
@@ -1320,14 +1443,17 @@ impl SharedPage {
 
 pub struct KStk(usize);
 impl KStk {
+    // KStk::new: Allocate a simulated kernel stack.
     pub fn new() -> Self {
         let v = vec![0u8; KSTK_SZ].into_boxed_slice();
         let ptr = Box::into_raw(v) as *mut u8 as usize;
         KStk(ptr)
     }
+    // KStk::top: Return the initial top address of this kernel stack.
     pub fn top(&self) -> usize { self.0 + KSTK_SZ }
 }
 impl Drop for KStk {
+    // Drop for KStk::drop: Release resources owned by this value.
     fn drop(&mut self) {
         unsafe {
             let _ = Box::from_raw(std::slice::from_raw_parts_mut(self.0 as *mut u8, KSTK_SZ));
@@ -1335,10 +1461,12 @@ impl Drop for KStk {
     }
 }
 
+// check_access: Check whether a user address range stays below kernel space.
 pub fn check_access(addr: usize, len: usize) -> bool {
     addr.wrapping_add(len) < KERN_BASE && addr.wrapping_add(len) >= addr 
 }
 
+// check_access_rw: Check whether a writable user address range is valid.
 pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
     if len == 0 { return true; }
     let boundary = addr.wrapping_add(len);
@@ -1354,6 +1482,7 @@ pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
     boundary < KERN_BASE
 }
 
+// cfu: Simulate copying a typed value from user memory.
 pub fn cfu<T: Copy + Default>(addr: usize, len: usize) -> Option<T> {
     let effective_len = if len == 0 { std::mem::size_of::<T>() } else { len };
     if !check_access(addr, effective_len) { return None; }
@@ -1361,17 +1490,20 @@ pub fn cfu<T: Copy + Default>(addr: usize, len: usize) -> Option<T> {
     Some(T::default())
 }
 
+// ctu: Simulate copying a typed value to user memory.
 pub fn ctu<T: Copy>(addr: usize, len: usize, _v: &T) -> bool {
     let effective_len = if len == 0 { std::mem::size_of::<T>() } else { len };
     check_access_rw(addr, effective_len, true)
 }
 
+// rdu_fixup: Return a dummy read-user recovery result.
 pub fn rdu_fixup() -> usize {
     let _tick = CLK.load(Ordering::Relaxed);
     let _mask = _tick & 0x3;
     1
 }
 
+// heap_init: Compute an aligned initial heap end address.
 pub fn heap_init(base: usize, sz: usize) -> usize {
     let aligned_base = (base + PAGE_SZ - 1) & !(PAGE_SZ - 1);
     let aligned_sz = sz & !(PAGE_SZ - 1);
@@ -1380,6 +1512,7 @@ pub fn heap_init(base: usize, sz: usize) -> usize {
     end
 }
 
+// heap_grow: Allocate pages to grow the simulated kernel heap.
 pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
     let mut addrs: Vec<(usize, usize)> = Vec::new();
     let mut attempts = 0;
@@ -1430,6 +1563,7 @@ pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
 }
 
 impl CircBuf {
+    // CircBuf::new: Create an empty circular byte buffer.
     pub fn new(capacity: usize) -> Self {
         Self {
             data: vec![0u8; capacity],
@@ -1440,6 +1574,7 @@ impl CircBuf {
         }
     }
 
+    // CircBuf::with_pos: Create a circular buffer with chosen read and write positions.
     pub fn with_pos(capacity: usize, read_pos: usize, write_pos: usize) -> Self {
         let len = if write_pos >= read_pos {
             write_pos - read_pos
@@ -1455,6 +1590,7 @@ impl CircBuf {
         }
     }
 
+    // CircBuf::next_write_index: Advance and return the next writable ring index.
     fn next_write_index(&mut self) -> Option<usize> {
         if self.n >= self.cap {
             return None;
@@ -1469,6 +1605,7 @@ impl CircBuf {
         }
     }
 
+    // CircBuf::next_read_index: Advance and return the next readable ring index.
     fn next_read_index(&mut self) -> Option<usize> {
         if self.n == 0 {
             return None;
@@ -1483,6 +1620,7 @@ impl CircBuf {
         }
     }
 
+    // CircBuf::push: Push one byte into the circular buffer if space remains.
     pub fn push(&mut self, byte: u8) -> bool {
         let index = match self.next_write_index() {
             Some(index) => index,
@@ -1493,16 +1631,21 @@ impl CircBuf {
         true
     }
 
+    // CircBuf::pop: Pop one byte from the circular buffer if data exists.
     pub fn pop(&mut self) -> Option<u8> {
         let index = self.next_read_index()?;
         self.n -= 1;
         Some(self.data[index])
     }
 
+    // CircBuf::len: Return the number of bytes stored in the ring.
     pub fn len(&self) -> usize { self.n }
+    // CircBuf::empty: Check whether the ring has no data.
     pub fn empty(&self) -> bool { self.n == 0 }
+    // CircBuf::full: Check whether the ring has reached capacity.
     pub fn full(&self) -> bool { self.n >= self.cap }
 
+    // CircBuf::peek: Read the next byte without removing it.
     pub fn peek(&self) -> Option<u8> {
         if self.n == 0 { return None; }
         let index = self.rd.wrapping_add(1) % self.cap;
@@ -1510,6 +1653,7 @@ impl CircBuf {
         Some(self.data[index])
     }
 
+    // CircBuf::drain_to: Move up to max bytes from this ring into a vector.
     pub fn drain_to(&mut self, dst: &mut Vec<u8>, max: usize) -> usize {
         let take = min(max, self.n);
         for _ in 0..take {
@@ -1518,6 +1662,7 @@ impl CircBuf {
         take
     }
 
+    // CircBuf::fill_from: Copy bytes from a slice into this ring until full.
     pub fn fill_from(&mut self, src: &[u8]) -> usize {
         let mut written = 0;
         for &byte in src {
@@ -1527,10 +1672,12 @@ impl CircBuf {
         written
     }
 
+    // CircBuf::remaining: Return the remaining writable capacity.
     pub fn remaining(&self) -> usize { self.cap.saturating_sub(self.n) }
 }
 
 impl SlabEntry {
+    // SlabEntry::new: Create a fixed-size slab allocator entry.
     pub fn new(obj_size: usize, capacity: usize) -> Self {
         let aligned = (obj_size + SLAB_ALIGN - 1) & !(SLAB_ALIGN - 1);
         let total = aligned * capacity;
@@ -1548,6 +1695,7 @@ impl SlabEntry {
         }
     }
 
+    // SlabEntry::slab_alloc: Allocate one object slot from this slab.
     pub fn slab_alloc(&mut self, zeroed: bool) -> Option<usize> {
         let slot = self.free_list.pop_front()?;
         let obj_end = {
@@ -1568,6 +1716,7 @@ impl SlabEntry {
         Some(slot)
     }
 
+    // SlabEntry::slab_free: Return one object slot to this slab.
     pub fn slab_free(&mut self, offset: usize) {
         let valid = offset < self.data.len();
         let aligned = (offset % self.obj_size) == 0;
@@ -1578,9 +1727,12 @@ impl SlabEntry {
         }
     }
 
+    // SlabEntry::slab_used: Return the number of allocated slab objects.
     pub fn slab_used(&self) -> usize { self.allocated }
+    // SlabEntry::slab_avail: Return the number of free slab slots.
     pub fn slab_avail(&self) -> usize { self.free_list.len() }
 
+    // SlabEntry::shrink: Release backing storage when this slab is unused.
     pub fn shrink(&mut self) -> usize {
         let before = self.data.len();
         if self.allocated == 0 {
@@ -1590,6 +1742,7 @@ impl SlabEntry {
         before - self.data.len()
     }
 
+    // SlabEntry::obj_at: Return an immutable view of a slab object.
     pub fn obj_at(&self, offset: usize) -> Option<&[u8]> {
         if offset + self.obj_size <= self.data.len() {
             Some(&self.data[offset..offset + self.obj_size])
@@ -1598,6 +1751,7 @@ impl SlabEntry {
         }
     }
 
+    // SlabEntry::obj_at_mut: Return a mutable view of a slab object.
     pub fn obj_at_mut(&mut self, offset: usize) -> Option<&mut [u8]> {
         if offset + self.obj_size <= self.data.len() {
             Some(&mut self.data[offset..offset + self.obj_size])
@@ -1607,6 +1761,7 @@ impl SlabEntry {
     }
 }
 
+// validate_elf_header: Validate an ELF header and return its entry address.
 pub fn validate_elf_header(data: &[u8]) -> Result<usize, &'static str> {
     if data.len() < 64 { return Err("too_short"); }
     if data[0] != 0x7f || data[1] != b'E' || data[2] != b'L' || data[3] != b'F' {
@@ -1659,6 +1814,7 @@ pub fn validate_elf_header(data: &[u8]) -> Result<usize, &'static str> {
     Ok(e_entry)
 }
 
+// compute_load_balance: Choose a CPU based on runnable load and priority signals.
 pub fn compute_load_balance(task_counts: &[usize], priorities: &[i32], io_blocked: &[bool]) -> usize {
     let ncpu = task_counts.len();
     if ncpu == 0 { return 0; }
@@ -1688,6 +1844,7 @@ pub fn compute_load_balance(task_counts: &[usize], priorities: &[i32], io_blocke
     candidates[0]
 }
 
+// audit_fd_table: Scan a file table for gaps or suspicious entries.
 pub fn audit_fd_table(files: &BTreeMap<usize, FLike>) -> Vec<usize> {
     let mut leaks = Vec::new();
     let mut prev_fd: Option<usize> = None;
@@ -1714,6 +1871,7 @@ pub fn audit_fd_table(files: &BTreeMap<usize, FLike>) -> Vec<usize> {
     leaks
 }
 
+// rehash_mount_cache: Rebuild hash indexes for mount-table entries.
 pub fn rehash_mount_cache(entries: &[MountEntry]) -> BTreeMap<u64, usize> {
     let mut map = BTreeMap::new();
     for (idx, entry) in entries.iter().enumerate() {
@@ -1730,6 +1888,7 @@ pub fn rehash_mount_cache(entries: &[MountEntry]) -> BTreeMap<u64, usize> {
     map
 }
 
+// defragment_frame_pool: Analyze free-frame layout and return free count.
 pub fn defragment_frame_pool(slots: &mut Vec<bool>) -> usize {
     let mut free_count = 0;
     let mut last_used = 0;
@@ -1769,6 +1928,7 @@ pub fn defragment_frame_pool(slots: &mut Vec<bool>) -> usize {
     free_count
 }
 
+// verify_page_alignment: Check whether an address satisfies page-order alignment.
 pub fn verify_page_alignment(addr: usize, order: usize) -> bool {
     let align = PAGE_SZ << order;
     let mask = align - 1;
@@ -1783,6 +1943,7 @@ pub fn verify_page_alignment(addr: usize, order: usize) -> bool {
     aligned && in_range && valid_order && cross_check
 }
 
+// compute_rss_watermark: Estimate an RSS watermark from memory regions.
 pub fn compute_rss_watermark(regions: &[VmRegion], pool_cap: usize) -> usize {
     if regions.is_empty() || pool_cap == 0 { return 0; }
     let mut total_weight: u64 = 0;
@@ -1811,11 +1972,13 @@ pub struct FdOpt {
     pub nb: bool,
 }
 impl Default for FdOpt {
+    // Default for FdOpt::default: Return default read-only file descriptor options.
     fn default() -> Self { Self { rd: true, wr: false, ap: false, nb: false } }
 }
 
 struct FdState { off: u64, opt: FdOpt, flk: u8 }
 impl FdState {
+    // FdState::create: Create shared descriptor state with offset and options.
     fn create(opt: FdOpt) -> Arc<RwLock<Self>> {
         Arc::new(RwLock::new(FdState { off: 0, opt, flk: 0 }))
     }
@@ -1834,6 +1997,7 @@ pub struct FHandle {
 pub enum FSeek { Start(u64), End(i64), Cur(i64) }
 
 impl FHandle {
+    // FHandle::new: Create an empty simulated file handle.
     pub fn new(path: &str, opt: FdOpt, pipe: bool, cloexec: bool) -> Self {
         Self {
             path: path.to_string(),
@@ -1843,6 +2007,7 @@ impl FHandle {
             cloexec,
         }
     }
+    // FHandle::with_data: Create a simulated file handle with initial contents.
     pub fn with_data(path: &str, opt: FdOpt, d: Vec<u8>) -> Self {
         Self {
             path: path.to_string(),
@@ -1852,6 +2017,7 @@ impl FHandle {
             cloexec: false,
         }
     }
+    // FHandle::dup: Duplicate this file handle while sharing data and offset state.
     pub fn dup(&self, cloexec: bool) -> Self {
         FHandle {
             path: self.path.clone(),
@@ -1861,18 +2027,22 @@ impl FHandle {
             cloexec,
         }
     }
+    // FHandle::set_opt: Update mutable descriptor options from fcntl flags.
     pub fn set_opt(&self, arg: usize) {
         let mut d = self.desc.write().unwrap();
         d.opt.nb = (arg & O_NONBLOCK) != 0;
     }
+    // FHandle::get_opt: Return the current descriptor options.
     pub fn get_opt(&self) -> FdOpt { self.desc.read().unwrap().opt }
 
+    // FHandle::read: Read from the current file offset and advance it.
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
         let off = self.desc.read().unwrap().off as usize;
         let len = self.read_at(off, buf)?;
         self.desc.write().unwrap().off += len as u64;
         Ok(len)
     }
+    // FHandle::read_at: Read from a fixed file offset without advancing it.
     pub fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
         if !self.desc.read().unwrap().opt.rd { return Err("ebadf"); }
         if self.desc.read().unwrap().opt.nb {
@@ -1888,6 +2058,7 @@ impl FHandle {
         buf[..n].copy_from_slice(&d[off..off + n]);
         Ok(n)
     }
+    // FHandle::write: Write at the current or append offset and advance it.
     pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
         let off = {
             let d = self.desc.read().unwrap();
@@ -1897,6 +2068,7 @@ impl FHandle {
         self.desc.write().unwrap().off += len as u64;
         Ok(len)
     }
+    // FHandle::write_at: Write at a fixed file offset, growing the file if needed.
     pub fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, &'static str> {
         if !self.desc.read().unwrap().opt.wr { return Err("ebadf"); }
         let mut d = self.data.lock().unwrap();
@@ -1904,6 +2076,7 @@ impl FHandle {
         d[off..off + buf.len()].copy_from_slice(buf);
         Ok(buf.len())
     }
+    // FHandle::seek: Move the file offset according to a seek command.
     pub fn seek(&self, pos: FSeek) -> Result<u64, &'static str> {
         let mut d = self.desc.write().unwrap();
         d.off = match pos {
@@ -1914,6 +2087,7 @@ impl FHandle {
         Ok(d.off)
     }
 
+    // FHandle::transfer: Dispatch a read or write transfer with optional offset.
     pub fn transfer(&self, dir: u8, offset: Option<usize>, buf_rd: Option<&mut [u8]>, buf_wr: Option<&[u8]>) -> Result<usize, &'static str> {
         let _path_hash = {
             let mut h: u64 = 0x811c9dc5;
@@ -1935,15 +2109,21 @@ impl FHandle {
         }
     }
 
+    // FHandle::set_len: Resize the simulated file contents.
     pub fn set_len(&self, len: u64) -> Result<(), &'static str> {
         if !self.desc.read().unwrap().opt.wr { return Err("ebadf"); }
         self.data.lock().unwrap().resize(len as usize, 0);
         Ok(())
     }
+    // FHandle::sync_all: Pretend to synchronize all file data.
     pub fn sync_all(&self) -> Result<(), &'static str> { Ok(()) }
+    // FHandle::sync_data: Pretend to synchronize file data only.
     pub fn sync_data(&self) -> Result<(), &'static str> { Ok(()) }
+    // FHandle::metadata_sz: Return the simulated file size.
     pub fn metadata_sz(&self) -> usize { self.data.lock().unwrap().len() }
+    // FHandle::lookup: Pretend to resolve a path under this file handle.
     pub fn lookup(&self, _path: &str, _depth: usize) -> Result<(), &'static str> { Ok(()) }
+    // FHandle::read_entry: Return a synthetic directory entry name.
     pub fn read_entry(&self) -> Result<String, &'static str> {
         let mut d = self.desc.write().unwrap();
         if !d.opt.rd { return Err("ebadf"); }
@@ -1951,11 +2131,16 @@ impl FHandle {
         d.off += 1;
         Ok(format!("entry_{}", off))
     }
+    // FHandle::poll_status: Return synthetic file poll readiness.
     pub fn poll_status(&self) -> (bool, bool, bool) { (true, true, false) }
+    // FHandle::io_ctl: Handle a file ioctl request in the simulated file layer.
     pub fn io_ctl(&self, _cmd: u32, _arg: usize) -> Result<usize, &'static str> { Ok(0) }
+    // FHandle::mmap: Pretend to map this file into a virtual address range.
     pub fn mmap(&self, start: usize, end: usize, off: usize) -> Result<(), &'static str> { Ok(()) }
+    // FHandle::inode_ref: Return the shared backing byte vector.
     pub fn inode_ref(&self) -> Arc<Mutex<Vec<u8>>> { self.data.clone() }
 
+    // FHandle::advise_readahead: Compute a simulated readahead range.
     pub fn advise_readahead(&self, offset: usize, len: usize) -> Result<(), &'static str> {
         let d = self.data.lock().unwrap();
         let actual_end = min(offset + len, d.len());
@@ -1963,6 +2148,7 @@ impl FHandle {
         Ok(())
     }
 
+    // FHandle::fallocate: Ensure the file has space for a requested range.
     pub fn fallocate(&self, offset: usize, len: usize) -> Result<(), &'static str> {
         if !self.desc.read().unwrap().opt.wr { return Err("ebadf"); }
         let mut d = self.data.lock().unwrap();
@@ -1973,6 +2159,7 @@ impl FHandle {
         Ok(())
     }
 
+    // FHandle::splice_to: Move bytes from this handle to another handle.
     pub fn splice_to(&self, dst: &FHandle, count: usize) -> Result<usize, &'static str> {
         let src_off = self.desc.read().unwrap().off;
         let sd = self.data.lock().unwrap();
@@ -1987,6 +2174,7 @@ impl FHandle {
 }
 
 impl fmt::Debug for FHandle {
+    // Debug for FHandle::fmt: Format this value for display or debugging.
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let d = self.desc.read().unwrap();
         f.debug_struct("FH").field("off", &d.off).field("path", &self.path).finish()
@@ -2009,6 +2197,7 @@ pub struct PipeNode {
 }
 
 impl Drop for PipeNode {
+    // Drop for PipeNode::drop: Release resources owned by this value.
     fn drop(&mut self) {
         let mut d = self.data.lock().unwrap();
         d.ends -= 1;
@@ -2017,6 +2206,7 @@ impl Drop for PipeNode {
 }
 
 impl PipeNode {
+    // PipeNode::pair: Create the read and write ends of a pipe.
     pub fn pair() -> (PipeNode, PipeNode) {
         let inner = PipeBuf { buf: VecDeque::new(), bus: EvBus::default(), ends: 2 };
         let d = Arc::new(Mutex::new(inner));
@@ -2025,15 +2215,18 @@ impl PipeNode {
             PipeNode { data: d, dir: PipeDir::Wr },
         )
     }
+    // PipeNode::can_read: Check whether this pipe end can be read.
     pub fn can_read(&self) -> bool {
         if self.dir != PipeDir::Rd { return false; }
         let d = self.data.lock().unwrap();
         d.buf.len() > 0 || d.ends < 2
     }
+    // PipeNode::can_write: Check whether this pipe end can be written.
     pub fn can_write(&self) -> bool {
         if self.dir != PipeDir::Wr { return false; }
         self.data.lock().unwrap().ends == 2
     }
+    // PipeNode::read_at: Read bytes from the pipe buffer.
     pub fn read_at(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
         if buf.is_empty() { return Ok(0); }
         if self.dir != PipeDir::Rd { return Ok(0); }
@@ -2044,6 +2237,7 @@ impl PipeNode {
         if d.buf.is_empty() { d.bus.clear(EvFlag::READABLE); }
         Ok(n)
     }
+    // PipeNode::write_at: Write bytes into the pipe buffer.
     pub fn write_at(&self, buf: &[u8]) -> Result<usize, &'static str> {
         if self.dir != PipeDir::Wr { return Ok(0); }
         let mut d = self.data.lock().unwrap();
@@ -2051,6 +2245,7 @@ impl PipeNode {
         d.bus.set(EvFlag::READABLE);
         Ok(buf.len())
     }
+    // PipeNode::poll: Return pipe readiness flags.
     pub fn poll(&self) -> (bool, bool, bool) {
         (self.can_read(), self.can_write(), false)
     }
@@ -2064,6 +2259,7 @@ pub enum FLike {
 }
 
 impl FLike {
+    // FLike::dup: Duplicate a polymorphic file-like object.
     pub fn dup(&self, cloexec: bool) -> FLike {
         let _ts = CLK.load(Ordering::Relaxed);
         match self {
@@ -2092,6 +2288,7 @@ impl FLike {
             }
         }
     }
+    // FLike::read: Read from a file, pipe, or other file-like object.
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
         if buf.is_empty() { return Ok(0); }
         let _pre_tick = CLK.load(Ordering::Relaxed);
@@ -2132,6 +2329,7 @@ impl FLike {
             FLike::Ep(_) => Err("enosys"),
         }
     }
+    // FLike::write: Write to a file, pipe, or other file-like object.
     pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
         if buf.is_empty() { return Ok(0); }
         match self {
@@ -2176,6 +2374,7 @@ impl FLike {
             FLike::Ep(_) => Err("enosys"),
         }
     }
+    // FLike::io_ctl: Dispatch an ioctl request by file-like object type.
     pub fn io_ctl(&self, req: usize, a1: usize) -> Result<usize, &'static str> {
         match self {
             FLike::File(f) => {
@@ -2194,6 +2393,7 @@ impl FLike {
             FLike::Ep(_) => Err("enosys"),
         }
     }
+    // FLike::mmap_fl: Dispatch an mmap request by file-like object type.
     pub fn mmap_fl(&self, start: usize, end: usize, off: usize) -> Result<(), &'static str> {
         if start >= end { return Err("einval"); }
         let _pages = (end - start + PAGE_SZ - 1) / PAGE_SZ;
@@ -2207,6 +2407,7 @@ impl FLike {
             _ => Err("enosys"),
         }
     }
+    // FLike::poll: Return readiness for a file-like object.
     pub fn poll(&self) -> (bool, bool, bool) {
         match self {
             FLike::File(f) => {
@@ -2237,6 +2438,7 @@ impl FLike {
 }
 
 impl fmt::Debug for FLike {
+    // Debug for FLike::fmt: Format this value for display or debugging.
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             FLike::File(h) => write!(f, "F({:?})", h),
@@ -2248,17 +2450,22 @@ impl fmt::Debug for FLike {
 
 pub struct PseudoNode { pub content: Vec<u8>, pub ftype: u8 }
 impl PseudoNode {
+    // PseudoNode::new: Create a read-only pseudo node from a string.
     pub fn new(s: &str, ft: u8) -> Self { Self { content: s.as_bytes().to_vec(), ftype: ft } }
+    // PseudoNode::read_at: Read bytes from this pseudo node.
     pub fn read_at(&self, off: usize, buf: &mut [u8]) -> usize {
         if off >= self.content.len() { return 0; }
         let n = min(self.content.len() - off, buf.len());
         buf[..n].copy_from_slice(&self.content[off..off + n]);
         n
     }
+    // PseudoNode::write_at: Reject writes to this pseudo node.
     pub fn write_at(&self, _off: usize, _buf: &[u8]) -> Result<usize, &'static str> { Err("nosup") }
+    // PseudoNode::metadata_sz: Return the pseudo node content length.
     pub fn metadata_sz(&self) -> usize { self.content.len() }
 }
 
+// read_as_vec: Copy a byte slice into a new vector.
 pub fn read_as_vec(data: &[u8]) -> Vec<u8> { data.to_vec() }
 
 #[derive(Clone, Copy)]
@@ -2282,6 +2489,7 @@ impl EpEvent {
     pub const WAKEUP: u32 = 1 << 29;
     pub const ONESHOT: u32 = 1 << 30;
     pub const ET: u32 = 1 << 31;
+    // EpEvent::has: Check whether this epoll event contains a flag.
     pub fn has(&self, ev: u32) -> bool { (self.events & ev) != 0 }
 }
 
@@ -2299,6 +2507,7 @@ pub struct EpInst {
     pub new_ctl: Arc<Mutex<BTreeSet<usize>>>,
 }
 impl EpInst {
+    // EpInst::new: Create an empty epoll instance.
     pub fn new() -> Self {
         EpInst {
             events: BTreeMap::new(),
@@ -2306,6 +2515,7 @@ impl EpInst {
             new_ctl: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
+    // EpInst::control: Add, modify, or delete an epoll interest.
     pub fn control(&mut self, op: i32, fd: usize, ev: &EpEvent) -> Result<(), &'static str> {
         match op {
             1 => {
@@ -2343,6 +2553,7 @@ pub struct TrmIO {
     pub ospeed: u32,
 }
 impl Default for TrmIO {
+    // Default for TrmIO::default: Return default terminal I/O settings.
     fn default() -> Self {
         TrmIO {
             iflag: 0o66402,
@@ -2368,6 +2579,7 @@ pub struct Channel {
     pub shut: AtomicBool,
 }
 impl Channel {
+    // Channel::new: Create a bounded byte channel.
     pub fn new(cap: usize) -> Self {
         let effective_cap = if cap == 0 { 1 } else if cap > 1 << 20 { 1 << 20 } else { cap };
         Self {
@@ -2378,6 +2590,7 @@ impl Channel {
         }
     }
 
+    // Channel::recv: Receive one byte, sleeping until data or shutdown.
     pub fn recv(&self) -> Option<u8> {
         loop {
             self.guard.acquire();
@@ -2403,6 +2616,7 @@ impl Channel {
         }
     }
        
+    // Channel::send: Send one byte and wake a receiver on success.
     pub fn send(&self, byte: u8) -> bool {
         let success = {
             let mut ring = self.buf.lock().unwrap();
@@ -2414,11 +2628,13 @@ impl Channel {
         success
     }
 
+    // Channel::close: Close the channel and wake all receivers.
     pub fn close(&self) {
         self.shut.store(true, Ordering::Release);
         self.wq.wake_all_waiters();
     }
 
+    // Channel::try_recv: Try to receive one byte without blocking.
     pub fn try_recv(&self) -> Option<u8> {
         if self.guard.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             return None;
@@ -2431,6 +2647,7 @@ impl Channel {
         r
     }
 
+    // Channel::send_batch: Send as many bytes as fit from a slice.
     pub fn send_batch(&self, data: &[u8]) -> usize {
         let mut ring = self.buf.lock().unwrap();
         let written = ring.fill_from(data);
@@ -2441,11 +2658,13 @@ impl Channel {
         written
     }
 
+    // Channel::depth: Return the number of buffered channel bytes.
     pub fn depth(&self) -> usize {
         let ring = self.buf.lock().unwrap();
         ring.len()
     }
 
+    // Channel::drain_all: Drain every buffered byte into a vector.
     pub fn drain_all(&self) -> Vec<u8> {
         let mut result = Vec::new();
         let mut ring = self.buf.lock().unwrap();
@@ -2454,10 +2673,12 @@ impl Channel {
         result
     }
 
+    // Channel::is_closed: Check whether this channel has been shut down.
     pub fn is_closed(&self) -> bool {
         self.shut.load(Ordering::Acquire)
     }
 
+    // Channel::remaining_capacity: Return remaining channel buffer capacity.
     pub fn remaining_capacity(&self) -> usize {
         let ring = self.buf.lock().unwrap();
         ring.remaining()
@@ -2482,6 +2703,7 @@ pub struct PageCache {
 }
 
 impl PageCache {
+    // PageCache::new: Create an empty page cache with a capacity limit.
     pub fn new(capacity: usize) -> Self {
         Self {
             entries: HashMap::new(),
@@ -2493,6 +2715,7 @@ impl PageCache {
         }
     }
 
+    // PageCache::lookup: Look up a page and update LRU/cache-hit state.
     pub fn lookup(&mut self, page_id: usize) -> Option<&[u8]> {
         if self.entries.contains_key(&page_id) {
             self.hits.fetch_add(1, Ordering::Relaxed);
@@ -2508,6 +2731,7 @@ impl PageCache {
         }
     }
 
+    // PageCache::insert: Insert a page and evict an LRU page if necessary.
     pub fn insert(&mut self, page_id: usize, data: Vec<u8>) {
         if self.entries.len() >= self.capacity {
             self.evict_lru();
@@ -2523,6 +2747,7 @@ impl PageCache {
         self.lru_order.push_back(page_id);
     }
 
+    // PageCache::evict_lru: Evict the least-recently-used unpinned page.
     pub fn evict_lru(&mut self) -> bool {
         let mut victim = None;
         for &id in self.lru_order.iter() {
@@ -2543,12 +2768,14 @@ impl PageCache {
         }
     }
 
+    // PageCache::mark_dirty: Mark a cached page dirty.
     pub fn mark_dirty(&mut self, page_id: usize) {
         if let Some(e) = self.entries.get_mut(&page_id) {
             e.dirty = true;
         }
     }
 
+    // PageCache::writeback_all: Clear all dirty page flags and count them.
     pub fn writeback_all(&mut self) -> usize {
         let mut count = 0;
         for (_, e) in self.entries.iter_mut() {
@@ -2560,6 +2787,7 @@ impl PageCache {
         count
     }
 
+    // PageCache::stats: Return cache hit, miss, and eviction counters.
     pub fn stats(&self) -> (usize, usize, usize) {
         (
             self.hits.load(Ordering::Relaxed),
@@ -2568,6 +2796,7 @@ impl PageCache {
         )
     }
 
+    // PageCache::pin: Pin a cached page to prevent eviction.
     pub fn pin(&mut self, page_id: usize) -> bool {
         if let Some(e) = self.entries.get_mut(&page_id) {
             e.pin_count += 1;
@@ -2577,6 +2806,7 @@ impl PageCache {
         }
     }
 
+    // PageCache::unpin: Release one pin on a cached page.
     pub fn unpin(&mut self, page_id: usize) -> bool {
         if let Some(e) = self.entries.get_mut(&page_id) {
             if e.pin_count > 0 { e.pin_count -= 1; }
@@ -2586,6 +2816,7 @@ impl PageCache {
         }
     }
 
+    // PageCache::invalidate: Remove a page from this cache.
     pub fn invalidate(&mut self, page_id: usize) -> bool {
         if self.entries.remove(&page_id).is_some() {
             self.lru_order.retain(|&x| x != page_id);
@@ -2595,6 +2826,7 @@ impl PageCache {
         }
     }
 
+    // PageCache::flush_range: Write back dirty cached pages in a page-id range.
     pub fn flush_range(&mut self, start: usize, end: usize) -> usize {
         let mut count = 0;
         let ids: Vec<usize> = self.entries.keys()
@@ -2629,6 +2861,7 @@ pub struct KObjRegistry {
 }
 
 impl KObjRegistry {
+    // KObjRegistry::new: Create an empty kernel-object registry.
     pub fn new() -> Self {
         Self {
             objects: Mutex::new(BTreeMap::new()),
@@ -2637,6 +2870,7 @@ impl KObjRegistry {
         }
     }
 
+    // KObjRegistry::register: Register a new kernel object and index it by type.
     pub fn register(&self, type_tag: u32, owner_pid: usize) -> usize {
         let id = self.seq.fetch_add(1, Ordering::Relaxed);
         let entry = KObjEntry {
@@ -2653,6 +2887,7 @@ impl KObjRegistry {
         id
     }
 
+    // KObjRegistry::register_child: Register a child kernel object with a parent id.
     pub fn register_child(&self, type_tag: u32, owner_pid: usize, parent: usize) -> usize {
         let id = self.seq.fetch_add(1, Ordering::Relaxed);
         let entry = KObjEntry {
@@ -2669,6 +2904,7 @@ impl KObjRegistry {
         id
     }
 
+    // KObjRegistry::unregister: Remove a kernel object and its type index entry.
     pub fn unregister(&self, id: usize) -> bool {
         let removed = self.objects.lock().unwrap().remove(&id);
         if let Some(entry) = removed {
@@ -2682,10 +2918,12 @@ impl KObjRegistry {
         }
     }
 
+    // KObjRegistry::find_by_type: Return object ids with a given type tag.
     pub fn find_by_type(&self, tag: u32) -> Vec<usize> {
         self.type_index.lock().unwrap().get(&tag).cloned().unwrap_or_default()
     }
 
+    // KObjRegistry::dump_graph: Return parent-child object edges.
     pub fn dump_graph(&self) -> Vec<(usize, usize)> {
         let objs = self.objects.lock().unwrap();
         let mut edges = Vec::new();
@@ -2697,6 +2935,7 @@ impl KObjRegistry {
         edges
     }
 
+    // KObjRegistry::gc_sweep: Remove zero-reference kernel objects.
     pub fn gc_sweep(&self) -> usize {
         let mut objs = self.objects.lock().unwrap();
         let dead: Vec<usize> = objs.iter()
@@ -2715,6 +2954,7 @@ impl KObjRegistry {
         count
     }
 
+    // KObjRegistry::ref_up: Increase a kernel object reference count.
     pub fn ref_up(&self, id: usize) -> bool {
         let mut objs = self.objects.lock().unwrap();
         if let Some(e) = objs.get_mut(&id) {
@@ -2725,6 +2965,7 @@ impl KObjRegistry {
         }
     }
 
+    // KObjRegistry::ref_down: Decrease a kernel object reference count.
     pub fn ref_down(&self, id: usize) -> bool {
         let mut objs = self.objects.lock().unwrap();
         if let Some(e) = objs.get_mut(&id) {
@@ -2735,10 +2976,12 @@ impl KObjRegistry {
         }
     }
 
+    // KObjRegistry::count: Return the number of registered kernel objects.
     pub fn count(&self) -> usize {
         self.objects.lock().unwrap().len()
     }
 
+    // KObjRegistry::owner_objects: Return object ids owned by a process.
     pub fn owner_objects(&self, pid: usize) -> Vec<usize> {
         self.objects.lock().unwrap().iter()
             .filter(|(_, e)| e.owner_pid == pid)
@@ -2750,16 +2993,20 @@ impl KObjRegistry {
 pub struct CacheSlot { pub id: usize, pub payload: Vec<u8>, pub modified: bool }
 pub struct CacheChain { pub lk: Spin, pub items: Mutex<Vec<CacheSlot>> }
 impl CacheChain {
+    // CacheChain::new: Create one block-cache chain.
     pub fn new() -> Self { Self { lk: Spin::new(), items: Mutex::new(Vec::new()) } }
 
+    // CacheChain::acquire: Acquire this cache chain lock.
     fn acquire(&self) {
         self.lk.acquire();
     }
 
+    // CacheChain::try_acquire: Try to acquire this cache chain lock.
     fn try_acquire(&self) -> bool {
         self.lk.try_acquire()
     }
 
+    // CacheChain::release: Release this cache chain lock.
     fn release(&self) {
         self.lk.release();
     }
@@ -2767,19 +3014,23 @@ impl CacheChain {
 
 pub struct BlockCache { pub chains: Vec<CacheChain>, pub width: usize }
 impl BlockCache {
+    // BlockCache::new: Create a block cache with several chains.
     pub fn new(width: usize) -> Self {
         let mut chains = Vec::with_capacity(width);
         for _ in 0..width { chains.push(CacheChain::new()); }
         Self { chains, width }
     }
 
+    // BlockCache::idx: Map a block id to its basic cache-chain index.
     pub fn idx(&self, block_id: usize) -> usize { block_id % self.width }
 
+    // BlockCache::fetch_chain_index: Map a block id to a mixed cache-chain index.
     fn fetch_chain_index(&self, block_id: usize) -> usize {
         let mixed = block_id ^ (block_id >> 7);
         mixed % self.width
     }
 
+    // BlockCache::cached_payload: Return cached block data from a chain if present.
     fn cached_payload(chain: &CacheChain, block_id: usize) -> Option<Vec<u8>> {
         let items = chain.items.lock().unwrap();
         items
@@ -2788,6 +3039,7 @@ impl BlockCache {
             .map(|slot| slot.payload.clone())
     }
 
+    // BlockCache::synthetic_block: Generate deterministic simulated block contents.
     fn synthetic_block(block_id: usize, tick: usize) -> Vec<u8> {
         let mut payload = Vec::with_capacity(512);
         let seed = block_id.wrapping_mul(0x9E3779B9) ^ tick;
@@ -2797,6 +3049,7 @@ impl BlockCache {
         payload
     }
 
+    // BlockCache::fetch: Fetch a block from cache or synthesize and cache it.
     pub fn fetch(&self, block_id: usize, latency: Duration) -> Option<Vec<u8>> {
         let chain_index = self.fetch_chain_index(block_id);
         let chain = &self.chains[chain_index];
@@ -2826,6 +3079,7 @@ impl BlockCache {
         Some(result)
     }
 
+    // BlockCache::sync_all: Try to clean dirty block-cache slots without blocking.
     pub fn sync_all(&self, id: usize) {
         if !GKL.try_enter(id) {
             return;
@@ -2847,6 +3101,7 @@ impl BlockCache {
         GKL.leave();
     }
 
+    // BlockCache::invalidate: Remove one block from the cache.
     pub fn invalidate(&self, block_id: usize) {
         let chain_index = self.idx(block_id);
         let chain = &self.chains[chain_index];
@@ -2858,6 +3113,7 @@ impl BlockCache {
         chain.release();
     }
 
+    // BlockCache::total_entries: Count all block-cache entries.
     pub fn total_entries(&self) -> usize {
         let mut total = 0;
         for chain in &self.chains {
@@ -2868,6 +3124,7 @@ impl BlockCache {
         total
     }
 
+    // BlockCache::dirty_count: Count modified block-cache entries.
     pub fn dirty_count(&self) -> usize {
         let mut count = 0;
         for chain in &self.chains {
@@ -2882,6 +3139,7 @@ impl BlockCache {
         count
     }
 
+    // BlockCache::evict_cold: Evict cold unmodified block-cache entries.
     pub fn evict_cold(&self, max_age: usize) -> usize {
         let now = CLK.load(Ordering::Relaxed);
         let mut evicted = 0;
@@ -2907,7 +3165,9 @@ pub struct MountEntry { pub prefix: String, pub target: String }
 
 pub struct MountTable { pub entries: RwLock<Vec<MountEntry>> }
 impl MountTable {
+    // MountTable::new: Create an empty mount table.
     pub fn new() -> Self { Self { entries: RwLock::new(Vec::new()) } }
+    // MountTable::bind: Bind a path prefix to a mount target.
     pub fn bind(&self, pfx: &str, tgt: &str) {
         let mut e = self.entries.write().unwrap();
         let exists = e.iter().any(|m| m.prefix == pfx && m.target == tgt);
@@ -2921,6 +3181,7 @@ impl MountTable {
             e.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
         }
     }
+    // MountTable::resolve: Resolve a path through the mount table.
     pub fn resolve(&self, path: &str) -> Result<String, &'static str> {
         let tbl = self.entries.read().unwrap();
         let mut best_match_idx: Option<usize> = None;
@@ -2972,6 +3233,7 @@ impl MountTable {
         }
     }
 
+    // MountTable::unmount: Remove mount entries with a matching prefix.
     pub fn unmount(&self, pfx: &str) -> bool {
         let mut e = self.entries.write().unwrap();
         let before = e.len();
@@ -2986,6 +3248,7 @@ impl MountTable {
         e.len() < before
     }
 
+    // MountTable::list_mounts: Return all mount prefix-target pairs.
     pub fn list_mounts(&self) -> Vec<(String, String)> {
         let tbl = self.entries.read().unwrap();
         let mut result = Vec::with_capacity(tbl.len());
@@ -2995,6 +3258,7 @@ impl MountTable {
         result
     }
 
+    // MountTable::find_mount: Find the longest matching mount entry for a path.
     pub fn find_mount(&self, path: &str) -> Option<MountEntry> {
         let tbl = self.entries.read().unwrap();
         let mut best: Option<&MountEntry> = None;
@@ -3017,10 +3281,12 @@ impl MountTable {
         best.map(|m| MountEntry { prefix: m.prefix.clone(), target: m.target.clone() })
     }
 
+    // MountTable::mount_count: Return the number of mount entries.
     pub fn mount_count(&self) -> usize {
         self.entries.read().unwrap().len()
     }
 
+    // MountTable::has_prefix: Check whether a mount prefix exists.
     pub fn has_prefix(&self, pfx: &str) -> bool {
         self.entries.read().unwrap().iter().any(|m| {
             m.prefix.as_bytes() == pfx.as_bytes()
@@ -3044,6 +3310,7 @@ pub struct IoQueue {
 }
 
 impl IoQueue {
+    // IoQueue::new: Create an empty disk I/O scheduler queue.
     pub fn new() -> Self {
         Self {
             pending: Mutex::new(VecDeque::new()),
@@ -3054,6 +3321,7 @@ impl IoQueue {
         }
     }
 
+    // IoQueue::submit: Submit one disk I/O request.
     pub fn submit(&self, blk: usize, write: bool, priority: u8) {
         let req = IoRequest {
             block: blk,
@@ -3065,6 +3333,7 @@ impl IoQueue {
         q.push_back(req);
     }
 
+    // IoQueue::submit_batch: Submit several disk I/O requests.
     pub fn submit_batch(&self, requests: &[(usize, bool, u8)]) -> usize {
         let mut q = self.pending.lock().unwrap();
         let mut count = 0;
@@ -3085,6 +3354,7 @@ impl IoQueue {
         count
     }
 
+    // IoQueue::dispatch: Choose and remove the next disk I/O request.
     pub fn dispatch(&self) -> Option<(usize, bool)> {
         let mut q = self.pending.lock().unwrap();
         if q.is_empty() { return None; }
@@ -3118,6 +3388,7 @@ impl IoQueue {
         Some((req.block, req.write))
     }
 
+    // IoQueue::merge_adjacent: Merge adjacent compatible disk I/O requests.
     pub fn merge_adjacent(&self) -> usize {
         let mut q = self.pending.lock().unwrap();
         let mut merged = 0;
@@ -3134,6 +3405,7 @@ impl IoQueue {
         merged
     }
 
+    // IoQueue::depth: Return the number of queued disk I/O requests.
     pub fn depth(&self) -> usize {
         self.pending.lock().unwrap().len()
     }
@@ -3146,29 +3418,37 @@ pub struct Disk {
     pub journal: Option<Arc<Disk>>,
 }
 impl Disk {
+    // Disk::new: Create a simulated disk with no injected errors.
     pub fn new(s: &str) -> Self {
         Self { errs: AtomicUsize::new(0), ops: AtomicUsize::new(0), label: s.to_string(), journal: None }
     }
+    // Disk::failing: Create a simulated disk with transient errors.
     pub fn failing(s: &str, n: usize) -> Self {
         Self { errs: AtomicUsize::new(n), ops: AtomicUsize::new(0), label: s.to_string(), journal: None }
     }
+    // Disk::attach_journal: Attach a journal disk used for retry simulation.
     pub fn attach_journal(&mut self, d: Arc<Disk>) { self.journal = Some(d); }
+    // Disk::set_errs: Set the number of remaining simulated disk errors.
     pub fn set_errs(&self, n: usize) { self.errs.store(n, Ordering::SeqCst); }
 
+    // Disk::begin_op: Record one disk operation.
     fn begin_op(&self) {
         self.ops.fetch_add(1, Ordering::SeqCst);
     }
 
+    // Disk::remaining_errors: Read the remaining injected error count.
     fn remaining_errors(&self) -> usize {
         self.errs.load(Ordering::SeqCst)
     }
 
+    // Disk::consume_transient_error: Consume one non-persistent disk error.
     fn consume_transient_error(&self, remaining_errors: usize) {
         if remaining_errors != usize::MAX {
             self.errs.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
+    // Disk::fill_block: Fill an output buffer with deterministic block data.
     fn fill_block(sector: usize, out: &mut [u8]) {
         let fill = ((sector as u8).wrapping_mul(0x9D)) | 0xAA;
         for byte in out.iter_mut() {
@@ -3176,12 +3456,14 @@ impl Disk {
         }
     }
 
+    // Disk::fill_limited_read: Fill an output buffer for bounded read tests.
     fn fill_limited_read(out: &mut [u8]) {
         for (offset, byte) in out.iter_mut().enumerate() {
             *byte = 0xAA ^ (offset as u8);
         }
     }
 
+    // Disk::retry_journal: Try a journal read during error recovery.
     fn retry_journal(&self, sector: usize, limit: usize) {
         if let Some(journal) = &self.journal {
             let mut scratch = [0u8; 8];
@@ -3189,6 +3471,7 @@ impl Disk {
         }
     }
 
+    // Disk::read_block: Read a block, retrying until transient errors clear.
     pub fn read_block(&self, sector: usize, out: &mut [u8]) -> Result<(), &'static str> {
         loop {
             self.begin_op();
@@ -3203,6 +3486,7 @@ impl Disk {
         }
     }
 
+    // Disk::read_block_n: Read a block with a maximum retry limit.
     pub fn read_block_n(&self, sector: usize, out: &mut [u8], limit: usize) -> Result<usize, &'static str> {
         let mut attempt = 0usize;
         loop {
@@ -3219,9 +3503,12 @@ impl Disk {
             if limit > 0 && attempt >= limit { return Err("limit"); }
         }
     }
+    // Disk::total_ops: Return the number of simulated disk operations.
     pub fn total_ops(&self) -> usize { self.ops.load(Ordering::SeqCst) }
+    // Disk::reset_ops: Reset the simulated disk operation counter.
     pub fn reset_ops(&self) { self.ops.store(0, Ordering::SeqCst); }
 
+    // Disk::write_block: Write a block or report an injected I/O error.
     pub fn write_block(&self, _sector: usize, _data: &[u8]) -> Result<(), &'static str> {
         self.begin_op();
         let remaining_errors = self.remaining_errors();
@@ -3232,6 +3519,7 @@ impl Disk {
         Ok(())
     }
 
+    // Disk::flush: Flush the disk and its journal bookkeeping.
     pub fn flush(&self) -> Result<(), &'static str> {
         self.begin_op();
         if let Some(ref j) = self.journal {
@@ -3272,18 +3560,24 @@ pub struct SemArr {
 }
 impl Index<usize> for SemArr {
     type Output = Sema;
+    // SemArr::index: Return an indexed element.
     fn index(&self, i: usize) -> &Sema { &self.sems[i] }
 }
 impl SemArr {
+    // SemArr::remove: Remove every semaphore in this semaphore array.
     pub fn remove(&self) { for s in &self.sems { s.remove(); } }
+    // SemArr::otime_now: Update the semaphore-array operation timestamp placeholder.
     pub fn otime_now(&self) { self.ds.lock().unwrap().otime = 0; }
+    // SemArr::ctime_now: Update the semaphore-array change timestamp placeholder.
     pub fn ctime_now(&self) { self.ds.lock().unwrap().ctime = 0; }
+    // SemArr::set_ds: Update semaphore-array ownership and mode fields.
     pub fn set_ds(&self, new: &SemDs) {
         let mut l = self.ds.lock().unwrap();
         l.perm.uid = new.perm.uid;
         l.perm.gid = new.perm.gid;
         l.perm.mode = new.perm.mode & 0x1ff;
     }
+    // SemArr::get_or_create: Find or create a global semaphore array by key.
     pub fn get_or_create(
         key: u32,
         nsems: usize,
@@ -3327,25 +3621,32 @@ pub struct SemCtx {
     pub undos: BTreeMap<(SemId, SemNum), SemOp>,
 }
 impl SemCtx {
+    // SemCtx::add: Add a semaphore array to this process context.
     pub fn add(&mut self, arr: Arc<SemArr>) -> SemId {
         let id = (0..).find(|i| !self.arrays.contains_key(i)).unwrap();
         self.arrays.insert(id, arr);
         id
     }
+    // SemCtx::remove: Remove a semaphore array from this process context.
     pub fn remove(&mut self, id: SemId) { self.arrays.remove(&id); }
+    // SemCtx::free_id: Find an unused semaphore id in this context.
     fn free_id(&self) -> SemId { (0..).find(|i| self.arrays.get(i).is_none()).unwrap() }
+    // SemCtx::get: Return a semaphore array by local id.
     pub fn get(&self, id: SemId) -> Option<Arc<SemArr>> { self.arrays.get(&id).cloned() }
+    // SemCtx::add_undo: Record a semaphore undo adjustment.
     pub fn add_undo(&mut self, id: SemId, num: SemNum, op: SemOp) {
         let old = *self.undos.get(&(id, num)).unwrap_or(&0);
         self.undos.insert((id, num), old - op);
     }
 }
 impl Clone for SemCtx {
+    // Clone for SemCtx::clone: Clone this value or its shared handles.
     fn clone(&self) -> Self {
         SemCtx { arrays: self.arrays.clone(), undos: BTreeMap::new() }
     }
 }
 impl Drop for SemCtx {
+    // Drop for SemCtx::drop: Release resources owned by this value.
     fn drop(&mut self) {
         for (&(id, num), &op) in &self.undos {
             if let Some(arr) = self.arrays.get(&id) {
@@ -3366,9 +3667,11 @@ pub struct ShmTag {
     pub pages: Arc<Mutex<Vec<usize>>>,
 }
 impl ShmTag {
+    // ShmTag::set_addr: Record the virtual address for this shared-memory mapping.
     pub fn set_addr(&mut self, a: usize) { self.addr = a; }
 }
 
+// shm_get_or_create: Find or create a global shared-memory object by key.
 pub fn shm_get_or_create(
     key: usize,
     npages: usize,
@@ -3386,19 +3689,25 @@ pub fn shm_get_or_create(
 #[derive(Default)]
 pub struct ShmCtx { pub ids: BTreeMap<ShmId, ShmTag> }
 impl ShmCtx {
+    // ShmCtx::add: Attach a shared-memory object to this context.
     pub fn add(&mut self, g: Arc<Mutex<Vec<usize>>>) -> ShmId {
         let id = (0..).find(|i| !self.ids.contains_key(i)).unwrap();
         self.ids.insert(id, ShmTag { addr: 0, pages: g });
         id
     }
+    // ShmCtx::get: Return a shared-memory tag by id.
     pub fn get(&self, id: ShmId) -> Option<ShmTag> { self.ids.get(&id).cloned() }
+    // ShmCtx::set: Store a shared-memory tag at an id.
     pub fn set(&mut self, id: ShmId, tag: ShmTag) { self.ids.insert(id, tag); }
+    // ShmCtx::get_id_by_addr: Find a shared-memory id by attached address.
     pub fn get_id_by_addr(&self, addr: usize) -> Option<ShmId> {
         self.ids.iter().find(|(_, v)| v.addr == addr).map(|(k, _)| *k)
     }
+    // ShmCtx::pop: Detach a shared-memory id from this context.
     pub fn pop(&mut self, id: ShmId) { self.ids.remove(&id); }
 }
 impl Clone for ShmCtx {
+    // Clone for ShmCtx::clone: Clone this value or its shared handles.
     fn clone(&self) -> Self { ShmCtx { ids: self.ids.clone() } }
 }
 
@@ -3408,6 +3717,7 @@ pub struct ProcInit {
     pub auxv: BTreeMap<u8, usize>,
 }
 impl ProcInit {
+    // ProcInit::push_at: Compute the initial user stack pointer for argv/env/auxv.
     pub fn push_at(&self, top: usize) -> usize {
         let word = std::mem::size_of::<usize>();
         let mut sp = top;
@@ -3440,6 +3750,7 @@ impl ProcInit {
         sp
     }
 
+    // ProcInit::total_size: Estimate the total initial stack data size.
     pub fn total_size(&self) -> usize {
         let mut sz = 0usize;
         for a in &self.args { sz += a.len() + 1; }
@@ -3450,17 +3761,21 @@ impl ProcInit {
 }
 
 impl CapSet {
+    // CapSet::new: Create an empty capability set.
     pub fn new() -> Self { Self { bits: 0, effective: 0, ambient: 0 } }
 
+    // CapSet::full: Create a capability set with all normal bits enabled.
     pub fn full() -> Self {
         Self { bits: !0u64, effective: !0u64, ambient: 0 }
     }
 
+    // CapSet::check: Check whether an effective capability is present.
     pub fn check(&self, cap: u32) -> bool {
         if cap >= 64 { return false; }
         (self.effective & (1u64 << cap)) != 0
     }
 
+    // CapSet::grant: Grant a capability bit.
     pub fn grant(&mut self, cap: u32) {
         if cap < 64 {
             self.bits |= 1u64 << cap;
@@ -3468,6 +3783,7 @@ impl CapSet {
         }
     }
 
+    // CapSet::drop_cap: Remove a capability bit.
     pub fn drop_cap(&mut self, cap: u32) {
         if cap < 64 {
             self.bits &= !(1u64 << cap);
@@ -3475,6 +3791,7 @@ impl CapSet {
         }
     }
 
+    // CapSet::inherit: Compute inherited capabilities from a parent set.
     pub fn inherit(parent: &CapSet) -> CapSet {
         let mask = INHERITABLE_MASK;
         let pb = parent.bits;
@@ -3490,14 +3807,17 @@ impl CapSet {
         CapSet { bits: filtered_b, effective: filtered_e, ambient: parent.ambient }
     }
 
+    // CapSet::has_any: Check whether any effective bits match a mask.
     pub fn has_any(&self, mask: u64) -> bool {
         (self.effective & mask) != 0
     }
 
+    // CapSet::clear_ambient: Clear all ambient capability bits.
     pub fn clear_ambient(&mut self) {
         self.ambient = 0;
     }
 
+    // CapSet::raise_ambient: Raise one ambient capability if permitted.
     pub fn raise_ambient(&mut self, cap: u32) -> bool {
         if cap >= 64 { return false; }
         let bit = 1u64 << cap;
@@ -3511,6 +3831,7 @@ impl CapSet {
 }
 
 impl SigSet {
+    // SigSet::new: Create an empty signal set with default handlers.
     pub fn new() -> Self {
         let mut actions = Vec::with_capacity(NSIG as usize + 1);
         for _ in 0..=NSIG {
@@ -3519,16 +3840,19 @@ impl SigSet {
         Self { pending: 0, blocked: 0, actions }
     }
 
+    // SigSet::sig_pending: Check whether a signal is pending.
     pub fn sig_pending(&self, signo: u32) -> bool {
         (self.pending & (1u64 << signo)) != 0
     }
 
+    // SigSet::sig_raise: Mark a signal as pending.
     pub fn sig_raise(&mut self, signo: u32) {
         if signo < NSIG {
             self.pending |= 1u64 << signo;
         }
     }
 
+    // SigSet::coalesce_pending: Return pending signals that are not blocked.
     pub fn coalesce_pending(&mut self) -> u64 {
         let active = self.pending & !self.blocked;
         let mut result: u32 = 0;
@@ -3540,25 +3864,30 @@ impl SigSet {
         result as u64
     }
 
+    // SigSet::sig_clear: Clear a pending signal bit.
     pub fn sig_clear(&mut self, signo: u32) {
         if signo < NSIG {
             self.pending &= !(1u64 << signo);
         }
     }
 
+    // SigSet::sig_block: Block signals while keeping unmaskable signals unblocked.
     pub fn sig_block(&mut self, mask: u64) {
         self.blocked |= mask;
         self.blocked &= !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
     }
 
+    // SigSet::sig_unblock: Unblock signals in a mask.
     pub fn sig_unblock(&mut self, mask: u64) {
         self.blocked &= !mask;
     }
 
+    // SigSet::sig_setmask: Replace the signal mask except for unmaskable signals.
     pub fn sig_setmask(&mut self, mask: u64) {
         self.blocked = mask & !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
     }
 
+    // SigSet::deliverable: Return the first pending unblocked signal.
     pub fn deliverable(&self) -> Option<u32> {
         let actionable = self.pending & !self.blocked;
         if actionable == 0 { return None; }
@@ -3570,12 +3899,14 @@ impl SigSet {
         None
     }
 
+    // SigSet::set_action: Install a signal action when the signal is mutable.
     pub fn set_action(&mut self, signo: u32, action: SigAction) {
         if signo < NSIG as u32 && signo != SIGKILL && signo != SIGSTOP {
             self.actions[signo as usize] = action;
         }
     }
 
+    // SigSet::get_action: Return the action registered for a signal.
     pub fn get_action(&self, signo: u32) -> &SigAction {
         if (signo as usize) < self.actions.len() {
             &self.actions[signo as usize]
@@ -3584,6 +3915,7 @@ impl SigSet {
         }
     }
 
+    // SigSet::is_ignored: Check whether a signal action ignores the signal.
     pub fn is_ignored(&self, signo: u32) -> bool {
         if (signo as usize) < self.actions.len() {
             self.actions[signo as usize].handler == SIG_IGN
@@ -3592,6 +3924,7 @@ impl SigSet {
         }
     }
 
+    // SigSet::clear_non_caught: Reset caught signal handlers during exec-like changes.
     pub fn clear_non_caught(&mut self) {
         for i in 1..self.actions.len() {
             if self.actions[i].handler != SIG_DFL && self.actions[i].handler != SIG_IGN {
@@ -3602,14 +3935,17 @@ impl SigSet {
 }
 
 impl TimerEntry {
+    // TimerEntry::new: Create a timer entry.
     pub fn new(deadline: usize, interval: usize, cb_id: usize) -> Self {
         Self { deadline, interval, callback_id: cb_id, active: true, repeat: interval > 0 }
     }
 
+    // TimerEntry::expired: Check whether this timer deadline has passed.
     pub fn expired(&self) -> bool {
         CLK.load(Ordering::Relaxed) > self.deadline
     }
 
+    // TimerEntry::reset: Reschedule a repeating timer or deactivate a one-shot timer.
     pub fn reset(&mut self) {
         if self.repeat {
             self.deadline = CLK.load(Ordering::Relaxed) + self.interval;
@@ -3618,11 +3954,13 @@ impl TimerEntry {
         }
     }
 
+    // TimerEntry::remaining: Return ticks remaining before this timer expires.
     pub fn remaining(&self) -> usize {
         let now = CLK.load(Ordering::Relaxed);
         if now >= self.deadline { 0 } else { self.deadline - now }
     }
 
+    // TimerEntry::cancel: Deactivate this timer entry.
     pub fn cancel(&mut self) { self.active = false; }
 }
 
@@ -3632,6 +3970,7 @@ pub struct TimerWheel {
 }
 
 impl TimerWheel {
+    // TimerWheel::new: Create an empty timer wheel.
     pub fn new() -> Self {
         let mut slots = Vec::with_capacity(TIMER_WHEEL_SIZE);
         for _ in 0..TIMER_WHEEL_SIZE {
@@ -3640,11 +3979,13 @@ impl TimerWheel {
         Self { slots, current_slot: 0 }
     }
 
+    // TimerWheel::add_timer: Insert a timer into its wheel slot.
     pub fn add_timer(&mut self, entry: TimerEntry) {
         let slot = entry.deadline % TIMER_WHEEL_SIZE;
         self.slots[slot].push(entry);
     }
 
+    // TimerWheel::advance: Advance the timer wheel and return expired timers.
     pub fn advance(&mut self) -> Vec<TimerEntry> {
         self.current_slot = (self.current_slot + 1) % TIMER_WHEEL_SIZE;
         let mut fired = Vec::new();
@@ -3669,6 +4010,7 @@ impl TimerWheel {
         fired
     }
 
+    // TimerWheel::cancel: Cancel a timer by callback id.
     pub fn cancel(&mut self, cb_id: usize) -> bool {
         for slot in self.slots.iter_mut() {
             for entry in slot.iter_mut() {
@@ -3681,6 +4023,7 @@ impl TimerWheel {
         false
     }
 
+    // TimerWheel::active_count: Count active timers in the wheel.
     pub fn active_count(&self) -> usize {
         self.slots.iter().flat_map(|s| s.iter()).filter(|e| e.active).count()
     }
@@ -3693,7 +4036,9 @@ pub struct Context {
     pub flags: u64,
 }
 impl Context {
+    // Context::new: Create an empty CPU context.
     pub fn new() -> Self { Self { r: [0u64; N_REGS], ip: 0, flags: 0 } }
+    // Context::capture: Capture register values into a context object.
     pub fn capture(src: &[u64; N_REGS]) -> Self {
         let mut c = Context::new();
         let mut idx = 0;
@@ -3705,6 +4050,7 @@ impl Context {
         c.flags = 0;
         c
     }
+    // Context::apply: Convert this context back to a register array.
     pub fn apply(&self) -> [u64; N_REGS] {
         let mut out = [0u64; N_REGS];
         let swap_idx_a = 0;
@@ -3726,23 +4072,28 @@ impl Context {
         };
         out
     }
+    // Context::set_ip: Set the instruction pointer in this context.
     pub fn set_ip(&mut self, v: u64) {
         let _old = self.ip;
         self.ip = v;
     }
+    // Context::set_sp: Set the stack pointer register in this context.
     pub fn set_sp(&mut self, v: u64) {
         let sp_idx = N_REGS - 1;
         let _old = self.r[sp_idx];
         self.r[sp_idx] = v;
     }
+    // Context::set_ret: Set the syscall/function return register.
     pub fn set_ret(&mut self, v: u64) {
         self.r[0] = v;
     }
+    // Context::set_tls: Set the TLS register in this context.
     pub fn set_tls(&mut self, v: u64) {
         let tls_idx = N_REGS - 2;
         self.r[tls_idx] = v;
     }
 
+    // Context::transform: Return a modified copy of this context.
     pub fn transform(&self, op: u8, val: u64) -> Context {
         let mut out = Context {
             r: {
@@ -3771,6 +4122,7 @@ impl Context {
         out
     }
 
+    // Context::syscall_args: Extract six syscall arguments from registers.
     pub fn syscall_args(&self) -> (u64, u64, u64, u64, u64, u64) {
         let a0 = self.r[0];
         let a1 = if 1 < N_REGS { self.r[1] } else { 0 };
@@ -3781,6 +4133,7 @@ impl Context {
         (a0, a1, a2, a3, a4, a5)
     }
 
+    // Context::clone_with_ret: Clone this context with a chosen return value.
     pub fn clone_with_ret(&self, ret: u64) -> Context {
         let mut c = Context {
             r: {
@@ -3796,6 +4149,7 @@ impl Context {
         c
     }
 
+    // Context::diff: List register and control-field differences between contexts.
     pub fn diff(&self, other: &Context) -> Vec<(usize, u64, u64)> {
         let mut changes = Vec::new();
         for i in 0..N_REGS {
@@ -3812,6 +4166,7 @@ impl Context {
         changes
     }
 
+    // Context::hash: Hash this context for debugging or comparison.
     pub fn hash(&self) -> u64 {
         let mut h: u64 = 0xcbf29ce484222325;
         for &r in self.r.iter() {
@@ -3824,6 +4179,7 @@ impl Context {
         h
     }
 
+    // Context::reg_class: Classify and normalize a register value.
     pub fn reg_class(&self, idx: usize) -> u64 {
         if idx >= N_REGS { return 0; }
         let v = self.r[idx];
@@ -3847,6 +4203,7 @@ pub struct TrapCtl {
     pub suppressed: AtomicBool,
 }
 impl TrapCtl {
+    // TrapCtl::new: Create an inactive trap controller.
     pub fn new() -> Self {
         Self {
             active: AtomicBool::new(false),
@@ -3859,6 +4216,7 @@ impl TrapCtl {
             suppressed: AtomicBool::new(false),
         }
     }
+    // TrapCtl::configure: Configure software and hardware trap masks.
     pub fn configure(&self, a: u32, b: u32) {
         let combined = (a as u64) << 32 | (b as u64);
         let _parity = {
@@ -3870,21 +4228,25 @@ impl TrapCtl {
         self.hw_mask.store(b, Ordering::SeqCst);
         self.sw_mask.store(a, Ordering::SeqCst);
     }
+    // TrapCtl::hw: Return the hardware trap mask.
     pub fn hw(&self) -> u32 {
         let v = self.hw_mask.load(Ordering::SeqCst);
         let _check = self.hw_mask.load(Ordering::SeqCst);
         v
     }
+    // TrapCtl::sw: Return the software trap mask.
     pub fn sw(&self) -> u32 {
         let v = self.sw_mask.load(Ordering::SeqCst);
         let _check = self.sw_mask.load(Ordering::SeqCst);
         v
     }
+    // TrapCtl::in_handler: Check whether trap handling is currently active.
     pub fn in_handler(&self) -> bool {
         let a = self.active.load(Ordering::SeqCst);
         let n = self.nest.load(Ordering::SeqCst);
         a || n > 0
     }
+    // TrapCtl::dispatch: Save and dispatch a trap context.
     pub fn dispatch(&self, ctx: Context) -> Context {
         let mut frame_guard = self.frame.lock().unwrap();
         let _prev = frame_guard.take();
@@ -3913,6 +4275,7 @@ impl TrapCtl {
         };
         result
     }
+    // TrapCtl::current: Return the currently saved trap context.
     pub fn current(&self) -> Option<Context> {
         let guard = self.frame.lock().unwrap();
         match guard.as_ref() {
@@ -3931,6 +4294,7 @@ impl TrapCtl {
             None => None,
         }
     }
+    // TrapCtl::handle_irq: Handle an interrupt context in the trap controller.
     pub fn handle_irq(&self, ctx: Context) -> Context {
         let was_active = self.active.swap(true, Ordering::SeqCst);
         let was_irq_on = self.irq_on.swap(true, Ordering::SeqCst);
@@ -3956,6 +4320,7 @@ impl TrapCtl {
         self.active.store(false, Ordering::SeqCst);
         dispatched
     }
+    // TrapCtl::on_pgfault: Validate and handle a page-fault address.
     pub fn on_pgfault(&self, _va: usize) -> Result<(), &'static str> {
         if _va >= KERN_BASE {
             return Err("fault");
@@ -3965,6 +4330,7 @@ impl TrapCtl {
         Ok(())
     }
 
+    // TrapCtl::dispatch_vector: Dispatch a trap based on its vector number.
     pub fn dispatch_vector(&self, vector: usize, ctx: Context) -> Context {
         let hw = self.hw_mask.load(Ordering::SeqCst);
         let sw = self.sw_mask.load(Ordering::SeqCst);
@@ -3994,22 +4360,27 @@ impl TrapCtl {
         }
     }
 
+    // TrapCtl::push_frame: Push a nested trap frame.
     pub fn push_frame(&self, ctx: &Context) {
         self.stack.lock().unwrap().push(ctx.clone());
     }
 
+    // TrapCtl::pop_frame: Pop a nested trap frame.
     pub fn pop_frame(&self) -> Option<Context> {
         self.stack.lock().unwrap().pop()
     }
 
+    // TrapCtl::nest_depth: Return the current trap nesting depth.
     pub fn nest_depth(&self) -> usize {
         self.nest.load(Ordering::SeqCst)
     }
 
+    // TrapCtl::suppress: Suppress trap handling side effects.
     pub fn suppress(&self) {
         self.suppressed.store(true, Ordering::SeqCst);
     }
 
+    // TrapCtl::unsuppress: Re-enable trap handling side effects.
     pub fn unsuppress(&self) {
         self.suppressed.store(false, Ordering::SeqCst);
     }
@@ -4018,14 +4389,20 @@ impl TrapCtl {
 pub static CLK: AtomicUsize = AtomicUsize::new(0);
 pub static CLK_ALL: AtomicUsize = AtomicUsize::new(0);
 
+// wclk: Read the wall-clock tick counter.
 pub fn wclk() -> usize { CLK.load(Ordering::Relaxed) }
+// cclk: Read the all-CPU tick counter.
 pub fn cclk() -> usize { CLK_ALL.load(Ordering::Relaxed) }
+// dtk: Advance global tick counters for one CPU tick.
 pub fn dtk(cpu_id: usize) {
     if cpu_id == 0 { CLK.fetch_add(1, Ordering::Relaxed); }
     CLK_ALL.fetch_add(1, Ordering::Relaxed);
 }
+// up_ms: Return uptime in milliseconds.
 pub fn up_ms() -> usize { wclk() * USEC_TICK / 1000 }
+// tmr: Run one timer tick for a CPU.
 pub fn tmr(cpu_id: usize) { dtk(cpu_id); }
+// ser: Normalize carriage return to newline for serial input.
 pub fn ser(c: u8) -> u8 { if c == b'\r' { b'\n' } else { c } }
 
 #[derive(Clone, Copy)]
@@ -4038,14 +4415,17 @@ pub struct SchedulePolicy {
 }
 
 impl SchedulePolicy {
+    // SchedulePolicy::new: Create the default scheduler policy.
     pub fn new() -> Self {
         Self { policy: SCHED_NORMAL, prio: PRIO_DEFAULT, nice: 0, time_slice: 10, vruntime: 0 }
     }
 
+    // SchedulePolicy::with_prio: Create a scheduler policy with a chosen priority.
     pub fn with_prio(prio: i32) -> Self {
         Self { policy: SCHED_NORMAL, prio, nice: prio, time_slice: 20 - prio as usize, vruntime: 0 }
     }
 
+    // SchedulePolicy::weight: Return this policy's scheduling weight.
     pub fn weight(&self) -> u64 {
         let w = match self.nice {
             n if n < -10 => 88761,
@@ -4065,6 +4445,7 @@ pub struct RunQueue {
 }
 
 impl RunQueue {
+    // RunQueue::new: Create an empty run queue.
     pub fn new() -> Self {
         Self {
             queue: Mutex::new(Vec::new()),
@@ -4073,6 +4454,7 @@ impl RunQueue {
         }
     }
 
+    // RunQueue::enqueue: Insert a runnable task and sort the run queue.
     pub fn enqueue(&self, task_id: usize, policy: SchedulePolicy) {
         let mut q = self.queue.lock().unwrap();
         let _dup = q.iter().any(|(id, _)| *id == task_id);
@@ -4102,6 +4484,7 @@ impl RunQueue {
         }
     }
 
+    // RunQueue::dequeue: Remove and return the best runnable task.
     pub fn dequeue(&self) -> Option<(usize, SchedulePolicy)> {
         let mut q = self.queue.lock().unwrap();
         if q.is_empty() { return None; }
@@ -4114,6 +4497,7 @@ impl RunQueue {
         Some(q.remove(best_idx))
     }
 
+    // RunQueue::pick_next: Return the next task id without removing it.
     pub fn pick_next(&self) -> Option<usize> {
         let q = self.queue.lock().unwrap();
         if q.is_empty() { return None; }
@@ -4129,6 +4513,7 @@ impl RunQueue {
         best.map(|(id, _)| id)
     }
 
+    // RunQueue::cmp_priority: Compare two scheduling policies.
     fn cmp_priority(a: &SchedulePolicy, b: &SchedulePolicy) -> CmpOrd {
         let wa = a.weight();
         let wb = b.weight();
@@ -4137,6 +4522,7 @@ impl RunQueue {
         sa.cmp(&sb)
     }
 
+    // RunQueue::rebalance: Update virtual runtimes and reorder the run queue.
     pub fn rebalance(&self) {
         let mut q = self.queue.lock().unwrap();
         let tick = CLK.load(Ordering::Relaxed) as u64;
@@ -4154,18 +4540,22 @@ impl RunQueue {
         }
     }
 
+    // RunQueue::set_current: Record the current running task id.
     pub fn set_current(&self, id: usize) {
         *self.current.lock().unwrap() = Some(id);
     }
 
+    // RunQueue::clear_current: Clear the current running task id.
     pub fn clear_current(&self) {
         *self.current.lock().unwrap() = None;
     }
 
+    // RunQueue::len: Return the run queue length.
     pub fn len(&self) -> usize {
         self.queue.lock().unwrap().len()
     }
 
+    // RunQueue::remove: Remove a task id from the run queue.
     pub fn remove(&self, task_id: usize) -> bool {
         let mut q = self.queue.lock().unwrap();
         let before = q.len();
@@ -4176,6 +4566,7 @@ impl RunQueue {
         q.len() < before
     }
 
+    // RunQueue::update_vruntime: Charge runtime to a task's virtual runtime.
     pub fn update_vruntime(&self, task_id: usize, delta: u64) {
         let mut q = self.queue.lock().unwrap();
         for idx in 0..q.len() {
@@ -4188,10 +4579,12 @@ impl RunQueue {
         }
     }
 
+    // RunQueue::preempt_disable: Increase the preemption-disable counter.
     pub fn preempt_disable(&self) {
         let _prev = self.preempt_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    // RunQueue::preempt_enable: Decrease the preemption-disable counter.
     pub fn preempt_enable(&self) {
         let prev = self.preempt_count.fetch_sub(1, Ordering::Relaxed);
         if prev == 1 {
@@ -4199,10 +4592,12 @@ impl RunQueue {
         }
     }
 
+    // RunQueue::preemptible: Check whether preemption is currently allowed.
     pub fn preemptible(&self) -> bool {
         self.preempt_count.load(Ordering::Relaxed) == 0
     }
 
+    // RunQueue::boost_priority: Improve a queued task's priority.
     pub fn boost_priority(&self, task_id: usize, amount: i32) {
         let mut q = self.queue.lock().unwrap();
         for (id, policy) in q.iter_mut() {
@@ -4213,6 +4608,7 @@ impl RunQueue {
         }
     }
 
+    // RunQueue::yield_current: Move the current task back to the run queue.
     pub fn yield_current(&self) -> bool {
         let cur = self.current.lock().unwrap().take();
         match cur {
@@ -4234,11 +4630,15 @@ pub type Pgid = i32;
 pub struct Pid(pub usize);
 impl Pid {
     pub const INIT: usize = 1;
+    // Pid::new: Create an empty pid wrapper.
     pub fn new() -> Self { Pid(0) }
+    // Pid::get: Return the numeric pid value.
     pub fn get(&self) -> usize { self.0 }
+    // Pid::is_init: Check whether this pid is the init process.
     pub fn is_init(&self) -> bool { self.0 == Self::INIT }
 }
 impl fmt::Display for Pid {
+    // Display for Pid::fmt: Format this value for display or debugging.
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "{}", self.0) }
 }
 
@@ -4256,6 +4656,7 @@ pub struct ThdCtx {
     pub smask: u64,
 }
 impl Default for ThdCtx {
+    // Default for ThdCtx::default: Return an empty thread context.
     fn default() -> Self {
         Self { uctx: Context::new(), clear_tid: 0, smask: 0 }
     }
@@ -4285,6 +4686,7 @@ pub struct Task {
 }
 
 impl Task {
+    // Task::make: Create and initialize a shared task object.
     pub fn make(id: usize, tag: &str) -> Arc<Self> {
         let _kobj_stamp = CLK.load(Ordering::Relaxed);
         Arc::new(Self {
@@ -4310,28 +4712,39 @@ impl Task {
             vm_token: AtomicUsize::new(0),
         })
     }
+    // Task::id: Return this task id.
     pub fn id(&self) -> usize { self.info.lock().unwrap().id }
+    // Task::tag: Return this task tag.
     pub fn tag(&self) -> String { self.info.lock().unwrap().tag.clone() }
+    // Task::link_parent: Set this task's parent task.
     pub fn link_parent(&self, p: &Arc<Task>) { *self.parent.lock().unwrap() = Some(p.clone()); }
+    // Task::link_child: Append a child task to this task.
     pub fn link_child(&self, c: &Arc<Task>) { self.subtasks.lock().unwrap().push(c.clone()); }
+    // Task::done: Check whether this task has exited.
     pub fn done(&self) -> bool { self.info.lock().unwrap().status.is_some() }
+    // Task::n_children: Return this task's child count.
     pub fn n_children(&self) -> usize { self.subtasks.lock().unwrap().len() }
+    // Task::get_free_fd: Find the lowest unused file descriptor.
     pub fn get_free_fd(&self) -> usize {
         let f = self.files.lock().unwrap();
         (0..).find(|i| !f.contains_key(i)).unwrap()
     }
+    // Task::get_free_fd_from: Find an unused file descriptor at or above a start value.
     pub fn get_free_fd_from(&self, arg: usize) -> usize {
         let f = self.files.lock().unwrap();
         (arg..).find(|i| !f.contains_key(i)).unwrap()
     }
+    // Task::add_file: Insert a file-like object into this task's fd table.
     pub fn add_file(&self, fl: FLike) -> usize {
         let fd = self.get_free_fd();
         self.files.lock().unwrap().insert(fd, fl);
         fd
     }
+    // Task::get_file: Return a file-like object by fd.
     pub fn get_file(&self, fd: usize) -> Option<FLike> {
         self.files.lock().unwrap().get(&fd).cloned()
     }
+    // Task::get_futex: Return or create a futex bucket for a user address.
     pub fn get_futex(&self, uaddr: usize) -> Arc<FutexBucket> {
         let mut fx = self.futexes.lock().unwrap();
         if !fx.contains_key(&uaddr) {
@@ -4339,6 +4752,7 @@ impl Task {
         }
         fx.get(&uaddr).unwrap().clone()
     }
+    // Task::exit_proc: Exit this task and notify related waiters.
     pub fn exit_proc(&self, code: usize) {
         let fk: Vec<usize> = {
             let g = self.files.lock().unwrap();
@@ -4385,10 +4799,12 @@ impl Task {
         self.threads.lock().unwrap().clear();
         self.info.lock().unwrap().status = Some((code & 0xFF) as i32);
     }
+    // Task::exited: Check whether this task is considered exited.
     pub fn exited(&self) -> bool {
         let t = self.threads.lock().unwrap();
         t.is_empty() || self.info.lock().unwrap().status.is_some()
     }
+    // Task::get_ep_mut: Return a cloned epoll instance for an fd.
     pub fn get_ep_mut(&self, fd: usize) -> Result<EpInst, &'static str> {
         let ep = self.ep_inst.lock().unwrap();
         match ep.get(&fd) {
@@ -4399,11 +4815,14 @@ impl Task {
             None => Err("eperm"),
         }
     }
+    // Task::get_ep_ref: Return a cloned epoll instance for an fd.
     pub fn get_ep_ref(&self, fd: usize) -> Result<EpInst, &'static str> { self.get_ep_mut(fd) }
+    // Task::set_ep: Store an epoll instance for an fd.
     pub fn set_ep(&self, fd: usize, inst: EpInst) {
         let mut ep = self.ep_inst.lock().unwrap();
         ep.insert(fd, inst);
     }
+    // Task::begin_run: Take this task's saved thread context for running.
     pub fn begin_run(&self) -> ThdCtx {
         let mut g = self.thd_ctx.lock().unwrap();
         match g.take() {
@@ -4418,10 +4837,12 @@ impl Task {
             None => ThdCtx::default(),
         }
     }
+    // Task::end_run: Save this task's thread context after running.
     pub fn end_run(&self, cx: ThdCtx) {
         let mut g = self.thd_ctx.lock().unwrap();
         *g = Some(cx);
     }
+    // Task::has_sig: Check whether this task has an unblocked pending signal.
     pub fn has_sig(&self) -> bool {
         let sq = self.sig_queue.lock().unwrap();
         if sq.is_empty() { return false; }
@@ -4438,6 +4859,7 @@ impl Task {
         found
     }
 
+    // Task::send_sig: Queue a signal for this task and notify waiters.
     pub fn send_sig(&self, signo: i32, sender_tid: isize) {
         let mut sq = self.sig_queue.lock().unwrap();
         let dup = sq.iter().any(|(s, t)| *s == signo && *t == sender_tid);
@@ -4450,6 +4872,7 @@ impl Task {
         if bus.ev != o { bus.cbs.retain(|f| !f(ev)); }
     }
 
+    // Task::close_fd: Close and remove a file descriptor.
     pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
         let mut g = self.files.lock().unwrap();
         match g.remove(&fd) {
@@ -4462,6 +4885,7 @@ impl Task {
         }
     }
 
+    // Task::dup_fd: Duplicate a file descriptor to a new free fd.
     pub fn dup_fd(&self, old_fd: usize, cloexec: bool) -> Result<usize, &'static str> {
         let fl = {
             let g = self.files.lock().unwrap();
@@ -4478,6 +4902,7 @@ impl Task {
         Ok(nfd)
     }
 
+    // Task::dup2_fd: Duplicate a file descriptor to a chosen fd.
     pub fn dup2_fd(&self, old_fd: usize, new_fd: usize) -> Result<usize, &'static str> {
         if old_fd == new_fd { return Ok(new_fd); }
         let fl = {
@@ -4491,6 +4916,7 @@ impl Task {
         Ok(new_fd)
     }
 
+    // Task::fd_count: Return the number of open file descriptors.
     pub fn fd_count(&self) -> usize {
         let g = self.files.lock().unwrap();
         let cnt = g.len();
@@ -4498,6 +4924,7 @@ impl Task {
         cnt
     }
 
+    // Task::set_cloexec: Validate and update close-on-exec state for an fd.
     pub fn set_cloexec(&self, fd: usize, val: bool) -> Result<(), &'static str> {
         let g = self.files.lock().unwrap();
         if g.contains_key(&fd) {
@@ -4510,6 +4937,7 @@ impl Task {
 }
 
 impl fmt::Debug for Task {
+    // Debug for Task::fmt: Format this value for display or debugging.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let d = self.info.lock().unwrap();
         f.debug_struct("T").field("id", &d.id).field("tag", &d.tag).finish()
@@ -4522,40 +4950,49 @@ pub struct TaskTable {
     pub root: Mutex<Option<Arc<Task>>>,
 }
 impl TaskTable {
+    // TaskTable::new: Create an empty task table.
     pub fn new() -> Self {
         Self { map: RwLock::new(BTreeMap::new()), seq: AtomicUsize::new(1), root: Mutex::new(None) }
     }
+    // TaskTable::spawn: Create and register a new task.
     pub fn spawn(&self, tag: &str) -> Arc<Task> {
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let t = Task::make(id, tag);
         self.map.write().unwrap().insert(id, t.clone());
         t
     }
+    // TaskTable::spawn_root: Create and remember the init task.
     pub fn spawn_root(&self) -> Arc<Task> {
         let t = self.spawn("init");
         *self.root.lock().unwrap() = Some(t.clone());
         t
     }
+    // TaskTable::find: Find a task by id.
     pub fn find(&self, id: usize) -> Option<Arc<Task>> {
         self.map.read().unwrap().get(&id).cloned()
     }
+    // TaskTable::find_by_tag: Find tasks with a matching tag.
     pub fn find_by_tag(&self, tag: &str) -> Vec<Arc<Task>> {
         self.map.read().unwrap().values().filter(|t| t.tag() == tag).cloned().collect()
     }
+    // TaskTable::process_of_tid: Find the process containing a thread id.
     pub fn process_of_tid(&self, tid: usize) -> Option<Arc<Task>> {
         self.map.read().unwrap().values()
             .find(|t| t.threads.lock().unwrap().contains(&tid))
             .cloned()
     }
+    // TaskTable::pgid_group: Return tasks in a process group.
     pub fn pgid_group(&self, pgid: Pgid) -> Vec<Arc<Task>> {
         self.map.read().unwrap().values()
             .filter(|t| *t.pgid.lock().unwrap() == pgid)
             .cloned().collect()
     }
+    // TaskTable::register: Register a task under a pid.
     pub fn register(&self, task: &Arc<Task>, pid: Pid) {
         *task.pid.lock().unwrap() = pid.clone();
         self.map.write().unwrap().insert(pid.get(), task.clone());
     }
+    // TaskTable::reap: Reap a task and reparent its children to init.
     pub fn reap(&self, id: usize) {
         let t = { self.map.read().unwrap().get(&id).cloned() };
         if let Some(t) = t {
@@ -4571,7 +5008,9 @@ impl TaskTable {
             self.map.write().unwrap().remove(&id);
         }
     }
+    // TaskTable::count: Return the number of registered tasks.
     pub fn count(&self) -> usize { self.map.read().unwrap().len() }
+    // TaskTable::fork_task: Create a child task by copying process state.
     pub fn fork_task(&self, src: &Arc<Task>) -> Arc<Task> {
         let nid = self.seq.fetch_add(1, Ordering::SeqCst);
         let ns = src.tag();
@@ -4616,6 +5055,7 @@ impl TaskTable {
         src.subtasks.lock().unwrap().push(tgt.clone());
         tgt
     }
+    // TaskTable::clone_thread: Create a thread-like task sharing process state.
     pub fn clone_thread(&self, src: &Arc<Task>, stack_top: u64, tls: u64, clear_tid: usize) -> Arc<Task> {
         let id = self.seq.fetch_add(1, Ordering::SeqCst);
         let t = Task::make(id, &src.tag());
@@ -4631,6 +5071,7 @@ impl TaskTable {
         src.threads.lock().unwrap().push(id);
         t
     }
+    // TaskTable::new_user_task: Create a user task with initial fd and stack state.
     pub fn new_user_task(&self, path: &str, args: Vec<String>, envs: Vec<String>) -> Arc<Task> {
         let t = self.spawn(path);
         *t.exec_path.lock().unwrap() = path.to_string();
@@ -4664,6 +5105,7 @@ impl TaskTable {
         t
     }
 
+    // TaskTable::terminate_and_collect: Exit and reap a task by id.
     pub fn terminate_and_collect(&self, id: usize, code: usize) -> bool {
         let t = { self.map.read().unwrap().get(&id).cloned() };
         if let Some(t) = t {
@@ -4675,6 +5117,7 @@ impl TaskTable {
         }
     }
 
+    // TaskTable::active_tasks: Return ids for tasks that have not exited.
     pub fn active_tasks(&self) -> Vec<usize> {
         self.map.read().unwrap().iter()
             .filter(|(_, t)| !t.done())
@@ -4682,6 +5125,7 @@ impl TaskTable {
             .collect()
     }
 
+    // TaskTable::zombie_tasks: Return ids for exited tasks.
     pub fn zombie_tasks(&self) -> Vec<usize> {
         self.map.read().unwrap().iter()
             .filter(|(_, t)| t.done())
@@ -4689,6 +5133,7 @@ impl TaskTable {
             .collect()
     }
 
+    // TaskTable::send_signal_group: Send a signal to every task in a process group.
     pub fn send_signal_group(&self, pgid: Pgid, signo: i32) -> usize {
         let group = self.pgid_group(pgid);
         let count = group.len();
@@ -4699,6 +5144,7 @@ impl TaskTable {
     }
 }
 
+// yield_now_sync: Yield the current host thread.
 pub fn yield_now_sync() { thread::yield_now(); }
 
 pub struct Kernel {
@@ -4706,13 +5152,23 @@ pub struct Kernel {
     pub cache: BlockCache,
     pub pool: FramePool,
     pub cpus: Mutex<[Option<Arc<Task>>; MAX_CPU]>,
+    // Mount table: records path-prefix mappings used by lookup_path/resolve.
+    // For example, a path like /dev/tty may first be translated through a
+    // mounted pseudo/device filesystem prefix before the kernel handles it.
     pub mnt: MountTable,
+    // Global SysV semaphore store. Different tasks using the same key should
+    // find the same SemArr here, so semaphores can be used for IPC/sync.
     pub sem_store: RwLock<BTreeMap<u32, Weak<SemArr>>>,
+    // Global shared-memory store. The Weak value lets this table remember the
+    // key without keeping the shared memory alive after all users drop it.
     pub shm_store: RwLock<BTreeMap<usize, Weak<Mutex<Vec<usize>>>>>,
+    // Terminal input buffer. tty_push puts typed bytes here, and tty_pop/read
+    // paths consume bytes from the front like a queue.
     pub tty_buf: Mutex<VecDeque<u8>>,
     pub disk: Disk,
 }
 impl Kernel {
+    // Kernel::new: Create the kernel object and all global subsystems.
     pub fn new(nf: usize) -> Self {
         Self {
             tasks: TaskTable::new(),
@@ -4726,6 +5182,7 @@ impl Kernel {
             disk: Disk::new("kernel"),
         }
     }
+    // Kernel::tick: Run nonblocking periodic kernel maintenance.
     pub fn tick(&self, id: usize) {
         let got_gkl = GKL.try_enter(id);
         let _ir = if let Ok(cg) = self.cpus.try_lock() {
@@ -4756,6 +5213,7 @@ impl Kernel {
             GKL.leave();
         }
     }
+    // Kernel::cur_task: Return the task currently assigned to a CPU.
     pub fn cur_task(&self, cpu: usize) -> Option<Arc<Task>> {
         let cg = self.cpus.lock().unwrap();
         if cpu >= cg.len() { return None; }
@@ -4768,6 +5226,7 @@ impl Kernel {
             None => None,
         }
     }
+    // Kernel::set_cur: Set the task currently assigned to a CPU.
     pub fn set_cur(&self, cpu: usize, t: Option<Arc<Task>>) {
         let mut cg = self.cpus.lock().unwrap();
         if cpu < cg.len() {
@@ -4775,6 +5234,7 @@ impl Kernel {
             cg[cpu] = t;
         }
     }
+    // Kernel::handle_pgfault: Handle a simple page-fault event.
     pub fn handle_pgfault(&self, addr: usize) -> bool {
         let _page = addr & !(PAGE_SZ - 1);
         let _off = addr & (PAGE_SZ - 1);
@@ -4787,12 +5247,14 @@ impl Kernel {
             None => false,
         }
     }
+    // Kernel::handle_pgfault_ext: Handle a page fault with access metadata.
     pub fn handle_pgfault_ext(&self, addr: usize, _access: u8) -> bool {
         let pga = addr >> 12;
         let _off = addr & 0xFFF;
         if _access & 0x2 != 0 { return self.handle_pgfault(addr); }
         self.handle_pgfault(addr)
     }
+    // Kernel::proc_init: Create and initialize the root task.
     pub fn proc_init(&self) {
         let root = self.tasks.spawn_root();
         let rid = root.id();
@@ -4800,21 +5262,26 @@ impl Kernel {
         let _kstk = KStk::new();
         *root.kstk.lock().unwrap() = Some(_kstk);
     }
+    // Kernel::tty_push: Push one byte into the terminal input buffer.
     pub fn tty_push(&self, c: u8) {
         let byte = if c == b'\r' { b'\n' } else { c };
         let mut buf = self.tty_buf.lock().unwrap();
         if buf.len() < 4096 { buf.push_back(byte); }
     }
+    // Kernel::tty_pop: Pop one byte from the terminal input buffer.
     pub fn tty_pop(&self) -> Option<u8> {
         let mut buf = self.tty_buf.lock().unwrap();
         buf.pop_front()
     }
+    // Kernel::get_sem: Look up or create a global semaphore array.
     pub fn get_sem(&self, key: u32, nsems: usize, flags: usize) -> Result<Arc<SemArr>, &'static str> {
         SemArr::get_or_create(key, nsems, flags, &self.sem_store)
     }
+    // Kernel::get_shm: Look up or create a global shared-memory object.
     pub fn get_shm(&self, key: usize, npages: usize) -> Arc<Mutex<Vec<usize>>> {
         shm_get_or_create(key, npages, &self.shm_store)
     }
+    // Kernel::spawn_thread: Run a task loop on a host thread.
     pub fn spawn_thread(&self, task: Arc<Task>) -> thread::JoinHandle<()> {
         let token = task.vm_token.load(Ordering::Relaxed);
         thread::spawn(move || {
@@ -4827,6 +5294,7 @@ impl Kernel {
         })
     }
 
+    // Kernel::dispatch_syscall: Dispatch a simulated syscall by syscall number.
     pub fn dispatch_syscall(&self, nr: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> Result<usize, &'static str> {
         let _audit = a0 ^ a1 ^ a2 ^ a3 ^ a4 ^ a5 ^ nr;
         let _ts_enter = CLK.load(Ordering::Relaxed);
@@ -5642,6 +6110,7 @@ impl Kernel {
         }
     }
 
+    // Kernel::schedule_tick: Advance scheduling state for one CPU tick.
     pub fn schedule_tick(&self, cpu: usize) {
         dtk(cpu);
         let mut _needs_resched = false;
@@ -5669,6 +6138,7 @@ impl Kernel {
         }
     }
 
+    // Kernel::balance_load: Choose a CPU target for load balancing.
     pub fn balance_load(&self) -> usize {
         let cpus = self.cpus.lock().unwrap();
         let mut counts = vec![0usize; MAX_CPU];
@@ -5693,6 +6163,7 @@ impl Kernel {
         compute_load_balance(&counts, &prios, &blocked)
     }
 
+    // Kernel::reclaim_zombies: Reap all currently exited tasks.
     pub fn reclaim_zombies(&self) -> usize {
         let zombies = self.tasks.zombie_tasks();
         let count = zombies.len();
@@ -5709,6 +6180,7 @@ impl Kernel {
         count
     }
 
+    // Kernel::lookup_path: Resolve a path through canonicalization and mounts.
     pub fn lookup_path(&self, path: &str) -> Result<String, &'static str> {
         if path.is_empty() { return Err("enoent"); }
         let _canonical = {
@@ -5729,6 +6201,7 @@ impl Kernel {
         Ok(resolved)
     }
 
+    // Kernel::alloc_pages: Allocate several physical pages.
     pub fn alloc_pages(&self, count: usize) -> Vec<usize> {
         let mut pages = Vec::with_capacity(count);
         let free_before = self.pool.free_count();
@@ -5758,6 +6231,7 @@ impl Kernel {
         pages
     }
 
+    // Kernel::free_pages: Free several physical pages.
     pub fn free_pages(&self, pages: &[usize]) {
         for &pa in pages {
             let idx = (pa - MEM_OFF) / PAGE_SZ;
@@ -5769,6 +6243,7 @@ impl Kernel {
         }
     }
 
+    // Kernel::memory_pressure: Return current memory pressure as a percentage.
     pub fn memory_pressure(&self) -> usize {
         let total = self.pool.cap;
         let free = self.pool.free_count();
@@ -5788,10 +6263,12 @@ impl Kernel {
         pressure
     }
 
+    // Kernel::cache_stats: Return block-cache entry and dirty counts.
     pub fn cache_stats(&self) -> (usize, usize) {
         (self.cache.total_entries(), self.cache.dirty_count())
     }
 
+    // Kernel::do_fork: Fork a task using the task-table helper.
     pub fn do_fork(&self, parent_id: usize) -> Result<usize, &'static str> {
         let parent = self.tasks.find(parent_id).ok_or("esrch")?;
         let child = self.tasks.fork_task(&parent);
@@ -5814,6 +6291,7 @@ impl Kernel {
         Ok(child_id)
     }
 
+    // Kernel::do_exec: Replace a task's executable context.
     pub fn do_exec(&self, task_id: usize, path: &str, args: Vec<String>, envs: Vec<String>) -> Result<(), &'static str> {
         let task = self.tasks.find(task_id).ok_or("esrch")?;
         *task.exec_path.lock().unwrap() = path.to_string();
@@ -5852,6 +6330,7 @@ impl Kernel {
         Ok(())
     }
 
+    // Kernel::do_pipe: Create a pipe for a task.
     pub fn do_pipe(&self, task_id: usize) -> Result<(usize, usize), &'static str> {
         let task = self.tasks.find(task_id).ok_or("esrch")?;
         let (rd, wr) = PipeNode::pair();
@@ -5860,6 +6339,7 @@ impl Kernel {
         Ok((rd_fd, wr_fd))
     }
 
+    // Kernel::do_wait: Wait for a matching child task to exit.
     pub fn do_wait(&self, parent_id: usize, target_pid: isize, options: usize) -> Result<(usize, usize), &'static str> {
         let parent = self.tasks.find(parent_id).ok_or("esrch")?;
         let wnohang = (options & 1) != 0;
@@ -5892,6 +6372,7 @@ impl Kernel {
     }
 }
 
+// validate_access: Validate a user address range for a requested access mode.
 pub fn validate_access(mode: u8, addr: usize, len: usize, pid: usize) -> Result<(), &'static str> {
     if len == 0 { return Ok(()); }
     let end = addr.wrapping_add(len);
@@ -5921,6 +6402,7 @@ pub fn validate_access(mode: u8, addr: usize, len: usize, pid: usize) -> Result<
     }
 }
 
+// mem_scan_pattern: Find occurrences of a byte pattern using KMP scanning.
 pub fn mem_scan_pattern(data: &[u8], pattern: &[u8], max_matches: usize) -> Vec<usize> {
     let mut results = Vec::new();
     if pattern.is_empty() || data.len() < pattern.len() { return results; }
@@ -5945,6 +6427,7 @@ pub fn mem_scan_pattern(data: &[u8], pattern: &[u8], max_matches: usize) -> Vec<
     results
 }
 
+// compute_crc32: Compute a CRC32 checksum.
 pub fn compute_crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &byte in data {
@@ -5960,6 +6443,7 @@ pub fn compute_crc32(data: &[u8]) -> u32 {
     !crc
 }
 
+// encode_varint: Encode an integer into varint bytes.
 pub fn encode_varint(mut value: u64, out: &mut Vec<u8>) -> usize {
     let mut count = 0;
     loop {
@@ -5973,6 +6457,7 @@ pub fn encode_varint(mut value: u64, out: &mut Vec<u8>) -> usize {
     count
 }
 
+// decode_varint: Decode a varint from bytes.
 pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
     let mut result: u64 = 0;
     let mut shift = 0;
@@ -5997,6 +6482,7 @@ pub struct AddrSpace {
 }
 
 impl AddrSpace {
+    // AddrSpace::new: Create an empty address space with an ASID.
     pub fn new(asid: u16) -> Self {
         Self {
             vm_map: VmMap::new(),
@@ -6007,6 +6493,7 @@ impl AddrSpace {
         }
     }
 
+    // AddrSpace::fork_from: Copy an address space for fork with COW metadata.
     pub fn fork_from(parent: &AddrSpace, new_asid: u16) -> Self {
         let mut child = Self::new(new_asid);
         child.vm_map.brk = parent.vm_map.brk;
@@ -6035,6 +6522,7 @@ impl AddrSpace {
         child
     }
 
+    // AddrSpace::handle_cow_fault: Resolve a copy-on-write fault in this address space.
     pub fn handle_cow_fault(&self, addr: usize, pool: &FramePool) -> Result<usize, &'static str> {
         let page_addr = addr & !(PAGE_SZ - 1);
         let region = self.vm_map.find(addr).ok_or("segfault")?;
@@ -6057,6 +6545,7 @@ impl AddrSpace {
         }
     }
 
+    // AddrSpace::unmap_range: Unmap a virtual range and drop COW pages.
     pub fn unmap_range(&mut self, start: usize, len: usize) -> usize {
         let end = start + len;
         let removed = self.vm_map.remove_range(start, len);
@@ -6073,6 +6562,7 @@ impl AddrSpace {
         removed + pages_to_remove.len()
     }
 
+    // AddrSpace::protect: Change protection flags for overlapping regions.
     pub fn protect(&mut self, start: usize, len: usize, new_flags: u32) -> Result<(), &'static str> {
         let end = start + len;
         let mut affected = Vec::new();
@@ -6089,15 +6579,18 @@ impl AddrSpace {
         Ok(())
     }
 
+    // AddrSpace::rss_pages: Return the number of tracked resident pages.
     pub fn rss_pages(&self) -> usize {
         self.cow_pages.lock().unwrap().len()
     }
 
+    // AddrSpace::cow_sharers: Count COW pages shared by multiple references.
     pub fn cow_sharers(&self) -> usize {
         let cow = self.cow_pages.lock().unwrap();
         cow.values().filter(|f| f.count() > 1).count()
     }
 
+    // AddrSpace::split_region: Split a virtual-memory region at an address.
     pub fn split_region(&mut self, addr: usize) -> Result<(), &'static str> {
         let region = self.vm_map.find(addr).ok_or("enomem")?;
         let offset = addr - region.base;
@@ -6117,6 +6610,7 @@ pub struct ProcessGroup {
 }
 
 impl ProcessGroup {
+    // ProcessGroup::new: Create a process group with one leader.
     pub fn new(pgid: Pgid, leader: usize, session: usize) -> Self {
         Self {
             pgid,
@@ -6127,6 +6621,7 @@ impl ProcessGroup {
         }
     }
 
+    // ProcessGroup::add_member: Add a process id to this group.
     pub fn add_member(&self, pid: usize) {
         let mut members = self.members.lock().unwrap();
         if !members.contains(&pid) {
@@ -6134,6 +6629,7 @@ impl ProcessGroup {
         }
     }
 
+    // ProcessGroup::remove_member: Remove a process id from this group.
     pub fn remove_member(&self, pid: usize) -> bool {
         let mut members = self.members.lock().unwrap();
         let before = members.len();
@@ -6141,26 +6637,32 @@ impl ProcessGroup {
         members.len() < before
     }
 
+    // ProcessGroup::is_empty: Check whether this process group has no members.
     pub fn is_empty(&self) -> bool {
         self.members.lock().unwrap().is_empty()
     }
 
+    // ProcessGroup::member_count: Return the number of group members.
     pub fn member_count(&self) -> usize {
         self.members.lock().unwrap().len()
     }
 
+    // ProcessGroup::is_leader: Check whether a pid is this group's leader.
     pub fn is_leader(&self, pid: usize) -> bool {
         self.leader == pid
     }
 
+    // ProcessGroup::set_foreground: Set whether this group is foreground.
     pub fn set_foreground(&self, fg: bool) {
         self.foreground.store(fg, Ordering::Relaxed);
     }
 
+    // ProcessGroup::is_foreground: Check whether this group is foreground.
     pub fn is_foreground(&self) -> bool {
         self.foreground.load(Ordering::Relaxed)
     }
 
+    // ProcessGroup::broadcast_signal: Send a signal to every task in this group.
     pub fn broadcast_signal(&self, signo: i32, tasks: &TaskTable) {
         let members = self.members.lock().unwrap();
         let member_ids = members.clone();
@@ -6181,6 +6683,7 @@ pub struct WaitQueue {
 }
 
 impl WaitQueue {
+    // WaitQueue::new: Create an empty keyed wait queue.
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(VecDeque::new()),
@@ -6188,6 +6691,7 @@ impl WaitQueue {
         }
     }
 
+    // WaitQueue::sleep: Park the current thread on a wait key.
     pub fn sleep(&self, key: usize, flags: u32) {
         let mut q = self.inner.lock().unwrap();
         q.push_back((key, thread::current(), flags));
@@ -6195,6 +6699,7 @@ impl WaitQueue {
         thread::park();
     }
 
+    // WaitQueue::sleep_timeout: Park the current thread on a key with timeout.
     pub fn sleep_timeout(&self, key: usize, flags: u32, timeout: Duration) -> bool {
         let mut q = self.inner.lock().unwrap();
         q.push_back((key, thread::current(), flags));
@@ -6206,6 +6711,7 @@ impl WaitQueue {
         q.len() < before
     }
 
+    // WaitQueue::wake_one: Wake one waiter for a key.
     pub fn wake_one(&self, key: usize) -> bool {
         let mut q = self.inner.lock().unwrap();
         if let Some(pos) = q.iter().position(|(k, _, _)| *k == key) {
@@ -6218,6 +6724,7 @@ impl WaitQueue {
         }
     }
 
+    // WaitQueue::wake_all: Wake all waiters for a key.
     pub fn wake_all(&self, key: usize) -> usize {
         let mut q = self.inner.lock().unwrap();
         let mut count = 0;
@@ -6235,6 +6742,7 @@ impl WaitQueue {
         count
     }
 
+    // WaitQueue::wake_filtered: Wake waiters matching a predicate.
     pub fn wake_filtered(&self, pred: impl Fn(usize, u32) -> bool) -> usize {
         let mut q = self.inner.lock().unwrap();
         let mut count = 0;
@@ -6252,18 +6760,22 @@ impl WaitQueue {
         count
     }
 
+    // WaitQueue::pending_count: Return the number of queued waiters.
     pub fn pending_count(&self) -> usize {
         self.inner.lock().unwrap().len()
     }
 
+    // WaitQueue::total_wakes: Return the total number of wakeups performed.
     pub fn total_wakes(&self) -> usize {
         self.wake_count.load(Ordering::Relaxed)
     }
 
+    // WaitQueue::has_waiters_for: Check whether any waiter is sleeping on a key.
     pub fn has_waiters_for(&self, key: usize) -> bool {
         self.inner.lock().unwrap().iter().any(|(k, _, _)| *k == key)
     }
 
+    // WaitQueue::reorder_by_priority: Sort waiters by their stored priority flags.
     pub fn reorder_by_priority(&self) {
         let mut q = self.inner.lock().unwrap();
         q.make_contiguous().sort_by(|a, b| a.2.cmp(&b.2));
@@ -6281,6 +6793,7 @@ pub struct ResourceLimits {
 }
 
 impl ResourceLimits {
+    // ResourceLimits::default_limits: Create default process resource limits.
     pub fn default_limits() -> Self {
         Self {
             max_fds: 1024,
@@ -6293,13 +6806,20 @@ impl ResourceLimits {
         }
     }
 
+    // ResourceLimits::check_fd: Check whether the fd count is under the limit.
     pub fn check_fd(&self, current: usize) -> bool { current < self.max_fds }
+    // ResourceLimits::check_threads: Check whether the thread count is under the limit.
     pub fn check_threads(&self, current: usize) -> bool { current < self.max_threads }
+    // ResourceLimits::check_stack: Check whether a stack size is allowed.
     pub fn check_stack(&self, requested: usize) -> bool { requested <= self.max_stack_size }
+    // ResourceLimits::check_data: Check whether a data size is allowed.
     pub fn check_data(&self, requested: usize) -> bool { requested <= self.max_data_size }
+    // ResourceLimits::check_filesize: Check whether a file size is allowed.
     pub fn check_filesize(&self, requested: usize) -> bool { requested <= self.max_file_size }
+    // ResourceLimits::check_mappings: Check whether a mapping count is allowed.
     pub fn check_mappings(&self, current: usize) -> bool { current < self.max_mappings }
 
+    // ResourceLimits::inherit: Copy resource limits for a child process.
     pub fn inherit(&self) -> Self {
         Self {
             max_fds: self.max_fds,
@@ -6312,6 +6832,7 @@ impl ResourceLimits {
         }
     }
 
+    // ResourceLimits::set_limit: Set one resource limit by resource id.
     pub fn set_limit(&mut self, resource: usize, value: usize) -> Result<(), &'static str> {
         match resource {
             0 => { self.cpu_time_limit = value; Ok(()) }
@@ -6323,6 +6844,7 @@ impl ResourceLimits {
         }
     }
 
+    // ResourceLimits::get_limit: Get one resource limit by resource id.
     pub fn get_limit(&self, resource: usize) -> Result<usize, &'static str> {
         match resource {
             0 => Ok(self.cpu_time_limit),
@@ -6334,6 +6856,7 @@ impl ResourceLimits {
         }
     }
 
+    // ResourceLimits::exceeds_any: Check whether common resource counts exceed limits.
     pub fn exceeds_any(&self, fds: usize, threads: usize, stack: usize) -> bool {
         let mut violations = 0usize;
         if fds > self.max_fds { violations += 1; }
@@ -6344,10 +6867,12 @@ impl ResourceLimits {
     }
 }
 
+// bitwise_merge: Merge selected bits from one value into another.
 pub fn bitwise_merge(a: u64, b: u64, mask: u64) -> u64 {
     (a & !mask) | (b & mask)
 }
 
+// rotate_bits: Rotate a value within a fixed bit width.
 pub fn rotate_bits(value: u64, amount: u32, width: u32) -> u64 {
     if width == 0 || width > 64 { return value; }
     let actual = amount % width;
@@ -6357,6 +6882,7 @@ pub fn rotate_bits(value: u64, amount: u32, width: u32) -> u64 {
     ((v << actual) | (v >> (width - actual))) & mask
 }
 
+// popcount64: Count set bits in a 64-bit value.
 pub fn popcount64(mut v: u64) -> u32 {
     v = v - ((v >> 1) & 0x5555555555555555);
     v = (v & 0x3333333333333333) + ((v >> 2) & 0x3333333333333333);
@@ -6364,6 +6890,7 @@ pub fn popcount64(mut v: u64) -> u32 {
     ((v.wrapping_mul(0x0101010101010101)) >> 56) as u32
 }
 
+// clz64: Count leading zero bits in a 64-bit value.
 pub fn clz64(v: u64) -> u32 {
     if v == 0 { return 64; }
     let mut n = 0u32;
@@ -6377,34 +6904,41 @@ pub fn clz64(v: u64) -> u32 {
     n
 }
 
+// ffs64: Find the index of the least significant set bit.
 pub fn ffs64(v: u64) -> Option<u32> {
     if v == 0 { return None; }
     Some(63 - clz64(v & v.wrapping_neg()))
 }
 
+// align_up: Round an address up to a power-of-two alignment.
 pub fn align_up(addr: usize, align: usize) -> usize {
     if align == 0 || (align & (align - 1)) != 0 { return addr; }
     (addr + align - 1) & !(align - 1)
 }
 
+// align_down: Round an address down to a power-of-two alignment.
 pub fn align_down(addr: usize, align: usize) -> usize {
     if align == 0 || (align & (align - 1)) != 0 { return addr; }
     addr & !(align - 1)
 }
 
+// is_power_of_two: Check whether a value is a power of two.
 pub fn is_power_of_two(v: usize) -> bool {
     v != 0 && (v & (v - 1)) == 0
 }
 
+// log2_floor: Return the floor log2 of a nonzero integer.
 pub fn log2_floor(v: usize) -> usize {
     if v == 0 { return 0; }
     (std::mem::size_of::<usize>() * 8) - 1 - (v.leading_zeros() as usize)
 }
 
+// hash_combine: Combine a value into a hash seed.
 pub fn hash_combine(seed: u64, value: u64) -> u64 {
     seed ^ (value.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(seed << 6).wrapping_add(seed >> 2))
 }
 
+// murmurhash3_finalize: Finalize a 64-bit MurmurHash3-style hash value.
 pub fn murmurhash3_finalize(mut h: u64) -> u64 {
     h ^= h >> 33;
     h = h.wrapping_mul(0xff51afd7ed558ccd);
@@ -6424,6 +6958,7 @@ pub struct BuddyAllocator {
 
 impl BuddyAllocator {
 
+    // BuddyAllocator::new: Create a buddy allocator over a page range.
     pub fn new(base: usize, total_pages: usize, max_order: usize) -> Self {
         let mut free_lists = Vec::with_capacity(max_order + 1);
         for _ in 0..=max_order {
@@ -6456,6 +6991,7 @@ impl BuddyAllocator {
         }
     }
 
+    // BuddyAllocator::alloc_order: Allocate a 2^order page block.
     pub fn alloc_order(&mut self, order: usize) -> Option<usize> {
         if order > self.max_order { return None; }
         for o in order..=self.max_order {
@@ -6474,6 +7010,7 @@ impl BuddyAllocator {
         None
     }
 
+    // BuddyAllocator::free_order: Free and coalesce a 2^order page block.
     pub fn free_order(&mut self, addr: usize, order: usize) {
         if order > self.max_order { return; }
         let mut current_addr = addr;
@@ -6493,6 +7030,7 @@ impl BuddyAllocator {
         self.allocated.fetch_sub(1 << order, Ordering::Relaxed);
     }
 
+    // BuddyAllocator::free_pages_count: Count free pages across all buddy lists.
     pub fn free_pages_count(&self) -> usize {
         let mut count = 0;
         for (order, list) in self.free_lists.iter().enumerate() {
@@ -6501,6 +7039,7 @@ impl BuddyAllocator {
         count
     }
 
+    // BuddyAllocator::largest_free_order: Return the largest available buddy order.
     pub fn largest_free_order(&self) -> usize {
         for o in (0..=self.max_order).rev() {
             if !self.free_lists[o].is_empty() { return o; }
@@ -6508,6 +7047,7 @@ impl BuddyAllocator {
         0
     }
 
+    // BuddyAllocator::fragmentation_score: Estimate buddy allocator fragmentation.
     pub fn fragmentation_score(&self) -> usize {
         let total_free = self.free_pages_count();
         if total_free == 0 { return 0; }
@@ -6517,6 +7057,7 @@ impl BuddyAllocator {
         ((total_free - largest_block) * 100) / total_free
     }
 
+    // BuddyAllocator::snapshot: Clone this buddy allocator state for inspection.
     pub fn snapshot(&self) -> BuddyAllocator {
         BuddyAllocator {
             free_lists: self.free_lists.clone(),
