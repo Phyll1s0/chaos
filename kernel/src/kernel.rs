@@ -1010,21 +1010,51 @@ impl VmMap {
 
     // VmMap::remove_range: Remove regions overlapping a virtual address range.
     pub fn remove_range(&mut self, base: usize, len: usize) -> usize {
-        let end = base.wrapping_add(len);
-        let before = self.regions.len();
-        let mut i = 0;
-        while i < self.regions.len() {
-            let rb = self.regions[i].base;
-            let re = rb + self.regions[i].len;
-            if rb >= base && re <= end {
-                self.regions.remove(i);
-            } else if rb < end && re > base {
-                self.regions.remove(i);
-            } else {
-                i += 1;
+        let end = base.saturating_add(len);
+        let mut new_regions = Vec::new();
+        let mut removed = 0;
+
+        for region in self.regions.drain(..) {
+            let rb = region.base;
+            let re = region.base + region.len;
+
+            if re <= base || rb >= end {
+                new_regions.push(region);
+                continue;
+            }
+
+            removed += 1;
+
+            if rb < base {
+                let left_len = base - rb;
+                new_regions.push(VmRegion {
+                    base: rb,
+                    len: left_len,
+                    flags: region.flags,
+                    offset: region.offset,
+                    tag: region.tag,
+                    ref_count: AtomicUsize::new(region.ref_get()),
+                });
+            }
+
+            if re > end {
+                let right_base = end;
+                let right_len = re - end;
+                let right_offset = region.offset + (end - rb);
+
+                new_regions.push(VmRegion {
+                    base: right_base,
+                    len: right_len,
+                    flags: region.flags,
+                    offset: right_offset,
+                    tag: region.tag,
+                    ref_count: AtomicUsize::new(region.ref_get()),
+                });
             }
         }
-        before - self.regions.len()
+
+        self.regions = new_regions;
+        removed
     }
 
     // VmMap::find_free: Find a free aligned virtual-address range.
@@ -1702,8 +1732,8 @@ impl SlabEntry {
             let candidate = slot + self.obj_size;
             if candidate > self.data.len() { self.data.len() } else { candidate }
         };
-        let needs_init = zeroed | false;
-        if !needs_init {
+        let needs_init = zeroed;
+        if needs_init {
             let region = &mut self.data[slot..obj_end];
             let mut pos = 0;
             while pos < region.len() {
@@ -4757,7 +4787,7 @@ impl Task {
         let fk: Vec<usize> = {
             let g = self.files.lock().unwrap();
             g.keys().cloned().collect()
-        };
+        };// Collect fds to close outside the lock. so that we don't hold the lock while calling remove.
         let _n_closed = {
             let mut c = 0usize;
             for k in fk.iter() {
@@ -4926,12 +4956,17 @@ impl Task {
 
     // Task::set_cloexec: Validate and update close-on-exec state for an fd.
     pub fn set_cloexec(&self, fd: usize, val: bool) -> Result<(), &'static str> {
-        let g = self.files.lock().unwrap();
-        if g.contains_key(&fd) {
-            let _fl = g.get(&fd);
-            Ok(())
-        } else {
-            Err("ebadf")
+        let mut files = self.files.lock().unwrap();
+
+        match files.get_mut(&fd) {
+            Some(FLike::File(file)) => {
+                file.cloexec = val;
+                Ok(())
+            }
+            Some(_) => {
+                Ok(())
+            }
+            None => Err("ebadf"),
         }
     }
 }
