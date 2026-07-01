@@ -2169,11 +2169,15 @@ impl FHandle {
     // FHandle::seek: Move the file offset according to a seek command.
     pub fn seek(&self, pos: FSeek) -> Result<u64, &'static str> {
         let mut d = self.desc.write().unwrap();
-        d.off = match pos {
-            FSeek::Start(o) => o,
-            FSeek::End(o) => (self.data.lock().unwrap().len() as i64 + o) as u64,
-            FSeek::Cur(o) => (d.off as i64 + o) as u64,
+        let next = match pos {
+            FSeek::Start(o) => o as i128,
+            FSeek::End(o) => self.data.lock().unwrap().len() as i128 + o as i128,
+            FSeek::Cur(o) => d.off as i128 + o as i128,
         };
+        if next < 0 || next > u64::MAX as i128 {
+            return Err("einval");
+        }
+        d.off = next as u64;
         Ok(d.off)
     }
 
@@ -4514,7 +4518,9 @@ impl SchedulePolicy {
 
     // SchedulePolicy::with_prio: Create a scheduler policy with a chosen priority.
     pub fn with_prio(prio: i32) -> Self {
-        Self { policy: SCHED_NORMAL, prio, nice: prio, time_slice: 20 - prio as usize, vruntime: 0 }
+        let bounded_prio = prio.clamp(-20, 19);
+        let time_slice = (20i32 - bounded_prio).max(1) as usize;
+        Self { policy: SCHED_NORMAL, prio, nice: prio, time_slice, vruntime: 0 }
     }
 
     // SchedulePolicy::weight: Return this policy's scheduling weight.
@@ -5149,7 +5155,6 @@ impl TaskTable {
         let p = Pid(nid);
         self.register(&tgt, p);
         tgt.threads.lock().unwrap().push(nid);
-        src.subtasks.lock().unwrap().push(tgt.clone());
         tgt
     }
     // TaskTable::clone_thread: Create a thread-like task sharing process state.
