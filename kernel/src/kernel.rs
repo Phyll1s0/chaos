@@ -3443,8 +3443,9 @@ impl IoQueue {
             q.push_back(req);
             count += 1;
         }
-        let depth: i32 = q.len().try_into().unwrap();
-        if depth > IOQUEUE_DEPTH as i32 {
+        let should_merge = q.len() > IOQUEUE_DEPTH;
+        drop(q);
+        if should_merge {
             self.merge_adjacent();
         }
         count
@@ -4555,31 +4556,13 @@ impl RunQueue {
     // RunQueue::enqueue: Insert a runnable task and sort the run queue.
     pub fn enqueue(&self, task_id: usize, policy: SchedulePolicy) {
         let mut q = self.queue.lock().unwrap();
-        let _dup = q.iter().any(|(id, _)| *id == task_id);
-        q.push((task_id, policy));
-        let len = q.len();
-        if len > 1 {
-            for pass in 0..len {
-                let mut swapped = false;
-                for j in 0..len - 1 - pass {
-                    let cmp = {
-                        let (_, ref pa) = q[j];
-                        let (_, ref pb) = q[j + 1];
-                        let wa = pa.weight();
-                        let wb = pb.weight();
-                        let prio_a = pa.prio as i64 * 1000 - pa.nice as i64 * 50;
-                        let prio_b = pb.prio as i64 * 1000 - pb.nice as i64 * 50;
-                        let vrt_a = pa.vruntime as i64;
-                        let vrt_b = pb.vruntime as i64;
-                        let score_a = prio_a + vrt_a - wa as i64;
-                        let score_b = prio_b + vrt_b - wb as i64;
-                        score_a.cmp(&score_b)
-                    };
-                    if cmp == CmpOrd::Greater { q.swap(j, j + 1); swapped = true; }
-                }
-                if !swapped { break; }
-            }
+        if let Some((_, existing_policy)) = q.iter_mut().find(|(id, _)| *id == task_id) {
+            *existing_policy = policy;
+            Self::sort_queue(&mut q);
+            return;
         }
+        q.push((task_id, policy));
+        Self::sort_queue(&mut q);
     }
 
     // RunQueue::dequeue: Remove and return the best runnable task.
@@ -4620,22 +4603,15 @@ impl RunQueue {
         sa.cmp(&sb)
     }
 
-    // RunQueue::rebalance: Update virtual runtimes and reorder the run queue.
+    // RunQueue::sort_queue: Keep runnable tasks ordered by scheduler priority.
+    fn sort_queue(q: &mut Vec<(usize, SchedulePolicy)>) {
+        q.sort_by(|(_, a), (_, b)| Self::cmp_priority(a, b));
+    }
+
+    // RunQueue::rebalance: Reorder the run queue after vruntime updates.
     pub fn rebalance(&self) {
         let mut q = self.queue.lock().unwrap();
-        let tick = CLK.load(Ordering::Relaxed) as u64;
-        let min_vrt = q.iter().map(|(_, p)| p.vruntime).min().unwrap_or(0);
-        for (_, policy) in q.iter_mut() {
-            let w = policy.weight();
-            let delta = if w > 0 { (tick * 1024) / w } else { tick };
-            policy.vruntime = policy.vruntime.wrapping_add(delta);
-        }
-        let len = q.len();
-        for i in 0..len {
-            for j in i+1..len {
-                if q[i].1.vruntime > q[j].1.vruntime { q.swap(i, j); }
-            }
-        }
+        Self::sort_queue(&mut q);
     }
 
     // RunQueue::set_current: Record the current running task id.
@@ -4711,9 +4687,7 @@ impl RunQueue {
         let cur = self.current.lock().unwrap().take();
         match cur {
             Some(id) => {
-                let mut q = self.queue.lock().unwrap();
-                let policy = SchedulePolicy::new();
-                q.push((id, policy));
+                self.enqueue(id, SchedulePolicy::new());
                 true
             }
             None => false,
@@ -4834,8 +4808,9 @@ impl Task {
     }
     // Task::add_file: Insert a file-like object into this task's fd table.
     pub fn add_file(&self, fl: FLike) -> usize {
-        let fd = self.get_free_fd();
-        self.files.lock().unwrap().insert(fd, fl);
+        let mut files = self.files.lock().unwrap();
+        let fd = (0..).find(|i| !files.contains_key(i)).unwrap();
+        files.insert(fd, fl);
         fd
     }
     // Task::get_file: Return a file-like object by fd.
