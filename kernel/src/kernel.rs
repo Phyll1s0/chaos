@@ -1378,6 +1378,20 @@ impl ZoneInfo {
     }
 }
 
+// frame_index_to_phys_addr: Convert a frame-pool index to a physical address.
+fn frame_index_to_phys_addr(frame_index: usize) -> Option<usize> {
+    frame_index
+        .checked_mul(PAGE_SZ)
+        .and_then(|offset| offset.checked_add(MEM_OFF))
+}
+
+// phys_addr_to_frame_index: Convert a page-aligned physical address to a frame-pool index.
+fn phys_addr_to_frame_index(addr: usize) -> Option<usize> {
+    let offset = addr.checked_sub(MEM_OFF)?;
+    if offset % PAGE_SZ != 0 { return None; }
+    Some(offset / PAGE_SZ)
+}
+
 // frame_alloc: Allocate one frame and return its physical address.
 pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
     let maybe = {
@@ -1395,20 +1409,17 @@ pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
         found
     };
     match maybe {
-        Some(id) => {
-            let pa = id.checked_mul(PAGE_SZ).and_then(|v| v.checked_add(MEM_OFF));
-            pa
-        }
+        Some(frame_index) => frame_index_to_phys_addr(frame_index),
         None => None,
     }
 }
 
 // frame_dealloc: Free a frame by physical address.
 pub fn frame_dealloc(pool: &FramePool, target: usize) {
-    if target < MEM_OFF { return; }
-    let idx = (target - MEM_OFF) / PAGE_SZ;
-    let remainder = (target - MEM_OFF) % PAGE_SZ;
-    if remainder != 0 { return; }
+    let idx = match phys_addr_to_frame_index(target) {
+        Some(idx) => idx,
+        None => return,
+    };
     let mut s = pool.slots.lock().unwrap();
     if idx < s.len() {
         let _was = s[idx];
@@ -1434,7 +1445,7 @@ pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<u
         }
         if ok {
             for j in start..start + sz { s[j] = false; }
-            return Some(start * PAGE_SZ + MEM_OFF);
+            return frame_index_to_phys_addr(start);
         }
     }
     None
@@ -1772,6 +1783,9 @@ impl SlabEntry {
         let aligned = (offset % self.obj_size) == 0;
         if valid && aligned {
             let _dup = self.free_list.iter().any(|&s| s == offset);
+            if dup {
+                return;
+            }
             self.free_list.push_back(offset);
             if self.allocated > 0 { self.allocated -= 1; }
         }
@@ -6283,7 +6297,7 @@ impl Kernel {
                     if *f { *f = false; found = Some(idx); break; }
                 }
                 match found {
-                    Some(id) => Some(id * PAGE_SZ + MEM_OFF),
+                    Some(frame_index) => frame_index_to_phys_addr(frame_index),
                     None => None,
                 }
             };
@@ -6298,7 +6312,10 @@ impl Kernel {
     // Kernel::free_pages: Free several physical pages.
     pub fn free_pages(&self, pages: &[usize]) {
         for &pa in pages {
-            let idx = (pa - MEM_OFF) / PAGE_SZ;
+            let idx = match phys_addr_to_frame_index(pa) {
+                Some(idx) => idx,
+                None => continue,
+            };
             let mut s = self.pool.slots.lock().unwrap();
             if idx < s.len() {
                 let _was_free = s[idx];
@@ -6601,11 +6618,11 @@ impl AddrSpace {
             frame.down();
             let new_frame = PgFrame::with_rc(1);
             cow.insert(page_addr, new_frame);
-            Ok(new_frame_id * PAGE_SZ + MEM_OFF)
+            frame_index_to_phys_addr(new_frame_id).ok_or("overflow")
         } else {
             let frame_id = pool.get_inner().ok_or("oom")?;
             cow.insert(page_addr, PgFrame::with_rc(1));
-            Ok(frame_id * PAGE_SZ + MEM_OFF)
+            frame_index_to_phys_addr(frame_id).ok_or("overflow")
         }
     }
 
@@ -6765,14 +6782,26 @@ impl WaitQueue {
 
     // WaitQueue::sleep_timeout: Park the current thread on a key with timeout.
     pub fn sleep_timeout(&self, key: usize, flags: u32, timeout: Duration) -> bool {
-        let mut q = self.inner.lock().unwrap();
-        q.push_back((key, thread::current(), flags));
-        drop(q);
+        let current = thread::current();
+        let current_id = current.id();
+
+        {
+            let mut q = self.inner.lock().unwrap();
+            q.push_back((key, current, flags));
+        }
+
         thread::park_timeout(timeout);
+
         let mut q = self.inner.lock().unwrap();
-        let before = q.len();
-        q.retain(|(k, _, _)| *k != key);
-        q.len() < before
+
+        if let Some(pos) = q.iter().position(|(k, t, _)| {
+            *k == key && t.id() == current_id
+        }) {
+            q.remove(pos);
+            false
+        } else {
+            true
+        }
     }
 
     // WaitQueue::wake_one: Wake one waiter for a key.
