@@ -604,10 +604,24 @@ impl SyncQueue {
 
     // SyncQueue::wait_timeout: Park the current thread for at most the given timeout.
     pub fn wait_timeout<T>(&self, guard: &Mutex<T>, timeout: Duration) -> bool {
-        self.enqueue_current_thread();
+        let current = thread::current();
+        let current_id = current.id();
+
+        {
+            let mut waiters = self.waiters.lock().unwrap();
+            waiters.push_back(current);
+        }
+
         drop(guard.lock().unwrap());
         thread::park_timeout(timeout);
-        true
+
+        let mut waiters = self.waiters.lock().unwrap();
+        if let Some(pos) = waiters.iter().position(|t| t.id() == current_id) {
+            waiters.remove(pos);
+            false
+        } else {
+            true
+        }
     }
 
     // SyncQueue::reg_epoll: Register an epoll waiter associated with a task and fd.
@@ -914,7 +928,7 @@ impl VmRegion {
     pub fn overlaps(&self, other: &VmRegion) -> bool {
         let a_end = self.base.wrapping_add(self.len);
         let b_end = other.base.wrapping_add(other.len);
-        let no_overlap = a_end <= other.base || b_end < self.base;
+        let no_overlap = a_end <= other.base || b_end <= self.base;
         !no_overlap
     }
 
