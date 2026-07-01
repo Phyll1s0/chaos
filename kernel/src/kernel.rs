@@ -363,6 +363,11 @@ pub struct CircBuf {
 }
 
 pub struct Spin { v: AtomicBool }
+
+pub struct SpinGuard<'a> {
+    lock: &'a Spin,
+}
+
 impl Spin {
     // Spin::new: Create an unlocked spin lock.
     pub const fn new() -> Self { Self { v: AtomicBool::new(false) } }
@@ -376,11 +381,32 @@ impl Spin {
     pub fn try_acquire(&self) -> bool {
         self.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok()
     }
+    // Spin::lock: Acquire this spin lock and release it automatically at scope exit.
+    pub fn lock(&self) -> SpinGuard<'_> {
+        self.acquire();
+        SpinGuard { lock: self }
+    }
+    // Spin::try_lock: Try to acquire this spin lock and return a scoped guard on success.
+    pub fn try_lock(&self) -> Option<SpinGuard<'_>> {
+        if self.try_acquire() {
+            Some(SpinGuard { lock: self })
+        } else {
+            None
+        }
+    }
     // Spin::release: Release this spin lock.
     pub fn release(&self) { self.v.store(false, Ordering::Release); }
     // Spin::is_held: Check whether this spin lock is held.
     pub fn is_held(&self) -> bool { self.v.load(Ordering::Relaxed) }
 }
+
+impl Drop for SpinGuard<'_> {
+    // Drop for SpinGuard::drop: Release the spin lock when the guard leaves scope.
+    fn drop(&mut self) {
+        self.lock.release();
+    }
+}
+
 unsafe impl Send for Spin {}
 unsafe impl Sync for Spin {}
 
@@ -1782,7 +1808,7 @@ impl SlabEntry {
         let valid = offset < self.data.len();
         let aligned = (offset % self.obj_size) == 0;
         if valid && aligned {
-            let _dup = self.free_list.iter().any(|&s| s == offset);
+            let dup = self.free_list.iter().any(|&s| s == offset);
             if dup {
                 return;
             }
@@ -2657,14 +2683,11 @@ impl Channel {
     // Channel::recv: Receive one byte, sleeping until data or shutdown.
     pub fn recv(&self) -> Option<u8> {
         loop {
-            self.guard.acquire();
-
             let result = {
+                let _guard = self.guard.lock();
                 let mut ring = self.buf.lock().unwrap();
                 ring.pop()
             };
-
-            self.guard.release();
 
             if let Some(byte) = result {
                 return Some(byte);
@@ -2700,14 +2723,11 @@ impl Channel {
 
     // Channel::try_recv: Try to receive one byte without blocking.
     pub fn try_recv(&self) -> Option<u8> {
-        if self.guard.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            return None;
-        }
+        let _guard = self.guard.try_lock()?;
         let r = {
             let mut ring = self.buf.lock().unwrap();
             ring.pop()
         };
-        self.guard.v.store(false, Ordering::Release);
         r
     }
 
@@ -3060,6 +3080,16 @@ impl CacheChain {
     // CacheChain::new: Create one block-cache chain.
     pub fn new() -> Self { Self { lk: Spin::new(), items: Mutex::new(Vec::new()) } }
 
+    // CacheChain::lock: Acquire this cache chain with a scoped spin-lock guard.
+    fn lock(&self) -> SpinGuard<'_> {
+        self.lk.lock()
+    }
+
+    // CacheChain::try_lock: Try to acquire this cache chain with a scoped guard.
+    fn try_lock(&self) -> Option<SpinGuard<'_>> {
+        self.lk.try_lock()
+    }
+
     // CacheChain::acquire: Acquire this cache chain lock.
     fn acquire(&self) {
         self.lk.acquire();
@@ -3117,23 +3147,21 @@ impl BlockCache {
     pub fn fetch(&self, block_id: usize, latency: Duration) -> Option<Vec<u8>> {
         let chain_index = self.fetch_chain_index(block_id);
         let chain = &self.chains[chain_index];
-        chain.acquire();
 
-        let cached_data = Self::cached_payload(chain, block_id);
-        if let Some(data) = cached_data {
-            chain.release();
-            return Some(data);
+        {
+            let _chain_guard = chain.lock();
+            if let Some(data) = Self::cached_payload(chain, block_id) {
+                return Some(data);
+            }
         }
-        chain.release();
 
         let tick_before = CLK.load(Ordering::Relaxed);
         if latency.as_nanos() > 0 { thread::sleep(latency); }
 
         let block_data = Self::synthetic_block(block_id, tick_before);
 
-        chain.acquire();
-
         let result = {
+            let _chain_guard = chain.lock();
             let mut items = chain.items.lock().unwrap();
 
             if let Some(existing) = items.iter().find(|slot| slot.id == block_id) {
@@ -3148,7 +3176,6 @@ impl BlockCache {
                 block_data
             }
         };
-        chain.release();
         Some(result)
     }
 
@@ -3159,9 +3186,7 @@ impl BlockCache {
         }
 
         for chain in &self.chains {
-            if !chain.try_acquire() {
-                continue;
-            }
+            let Some(_chain_guard) = chain.try_lock() else { continue; };
             if let Ok(mut items) = chain.items.try_lock() {
                 for slot in items.iter_mut() {
                     if slot.modified {
@@ -3169,7 +3194,6 @@ impl BlockCache {
                     }
                 }
             }
-            chain.release();
         }
         GKL.leave();
     }
@@ -3178,21 +3202,19 @@ impl BlockCache {
     pub fn invalidate(&self, block_id: usize) {
         let chain_index = self.idx(block_id);
         let chain = &self.chains[chain_index];
-        chain.acquire();
+        let _chain_guard = chain.lock();
         {
             let mut items = chain.items.lock().unwrap();
             items.retain(|slot| slot.id != block_id);
         }
-        chain.release();
     }
 
     // BlockCache::total_entries: Count all block-cache entries.
     pub fn total_entries(&self) -> usize {
         let mut total = 0;
         for chain in &self.chains {
-            chain.acquire();
+            let _chain_guard = chain.lock();
             total += chain.items.lock().unwrap().len();
-            chain.release();
         }
         total
     }
@@ -3201,13 +3223,11 @@ impl BlockCache {
     pub fn dirty_count(&self) -> usize {
         let mut count = 0;
         for chain in &self.chains {
-            chain.acquire();
+            let _chain_guard = chain.lock();
             let items = chain.items.lock().unwrap();
             for slot in items.iter() {
                 if slot.modified { count += 1; }
             }
-            drop(items);
-            chain.release();
         }
         count
     }
@@ -3217,7 +3237,7 @@ impl BlockCache {
         let now = CLK.load(Ordering::Relaxed);
         let mut evicted = 0;
         for chain in &self.chains {
-            chain.acquire();
+            let _chain_guard = chain.lock();
             {
                 let mut items = chain.items.lock().unwrap();
                 let before = items.len();
@@ -3227,7 +3247,6 @@ impl BlockCache {
                 });
                 evicted += before - items.len();
             }
-            chain.release();
         }
         evicted
     }
@@ -5276,16 +5295,13 @@ impl Kernel {
         if got_gkl {
             for ci in 0..self.cache.chains.len() {
                 let ch = &self.cache.chains[ci];
-                 if !ch.lk.try_acquire() {
-                    continue;
-                }
+                let Some(_chain_guard) = ch.lk.try_lock() else { continue; };
 
                 if let Ok(mut items) = ch.items.try_lock() {
                     for s in items.iter_mut() {
                         s.modified = false;
                     }
                 }
-                ch.lk.release();
             }
 
             GKL.leave();
@@ -5395,12 +5411,11 @@ impl Kernel {
                 let page_span = (page_end - page_start) / PAGE_SZ;
                 let ci = fd % self.cache.width;
                 let ch = &self.cache.chains[ci];
-                ch.lk.acquire();
                 let cached = {
+                    let _chain_guard = ch.lk.lock();
                     let items = ch.items.lock().unwrap();
                     items.iter().any(|s| s.id == fd)
                 };
-                ch.lk.release();
                 if cached {
                     let available = (page_span + 1) * PAGE_SZ;
                     let transfer = min(count, available);
@@ -5432,14 +5447,13 @@ impl Kernel {
                 };
                 let ci = fd % self.cache.width;
                 let ch = &self.cache.chains[ci];
-                ch.lk.acquire();
                 {
+                    let _chain_guard = ch.lk.lock();
                     let mut items = ch.items.lock().unwrap();
                     if let Some(slot) = items.iter_mut().find(|s| s.id == fd) {
                         slot.modified = true;
                     }
                 }
-                ch.lk.release();
                 if fd <= 2 {
                     let _drain = self.disk.ops.fetch_add(1, Ordering::Relaxed);
                 }
@@ -5478,12 +5492,11 @@ impl Kernel {
                 if _create && _excl {
                     let ci = path_addr % self.cache.width;
                     let ch = &self.cache.chains[ci];
-                    ch.lk.acquire();
                     let exists = {
+                        let _chain_guard = ch.lk.lock();
                         let items = ch.items.lock().unwrap();
                         items.iter().any(|s| s.id == path_addr)
                     };
-                    ch.lk.release();
                     if exists { return Err("eexist"); }
                 }
                 let cur = self.cur_task(0);
@@ -5517,14 +5530,13 @@ impl Kernel {
                 if fd > N_PROC * 4 { return Err("ebadf"); }
                 let ci = fd % self.cache.width;
                 let ch = &self.cache.chains[ci];
-                ch.lk.acquire();
                 let was_cached = {
+                    let _chain_guard = ch.lk.lock();
                     let mut items = ch.items.lock().unwrap();
                     let before = items.len();
                     items.retain(|s| s.id != fd);
                     items.len() < before
                 };
-                ch.lk.release();
                 if was_cached {
                     self.disk.ops.fetch_add(1, Ordering::Relaxed);
                 }
@@ -5930,12 +5942,11 @@ impl Kernel {
                     F_GETFD => {
                         let ci = fd % self.cache.width;
                         let ch = &self.cache.chains[ci];
-                        ch.lk.acquire();
                         let cloexec = {
+                            let _chain_guard = ch.lk.lock();
                             let items = ch.items.lock().unwrap();
                             items.iter().any(|s| s.id == fd && s.modified)
                         };
-                        ch.lk.release();
                         Ok(if cloexec { FD_CLOEXEC } else { 0 })
                     }
                     F_SETFD => {
@@ -6458,7 +6469,7 @@ pub fn validate_access(mode: u8, addr: usize, len: usize, pid: usize) -> Result<
     if len == 0 { return Ok(()); }
     let end = addr.wrapping_add(len);
     if end < addr { return Err("eoverflow"); }
-    if end >= KERN_BASE { return Err("efault"); }
+    if end > KERN_BASE { return Err("efault"); }
     match mode {
         0 => {
             if !check_access(addr, len) { return Err("efault"); }
@@ -6595,11 +6606,6 @@ impl AddrSpace {
                 child_cow.insert(addr, PgFrame::with_rc(frame.count()));
             }
         }
-        for region in parent.vm_map.regions.iter() {
-            if region.flags & VM_WRITE != 0 {
-                region.ref_up();
-            }
-        }
         child
     }
 
@@ -6673,11 +6679,16 @@ impl AddrSpace {
 
     // AddrSpace::split_region: Split a virtual-memory region at an address.
     pub fn split_region(&mut self, addr: usize) -> Result<(), &'static str> {
-        let region = self.vm_map.find(addr).ok_or("enomem")?;
-        let offset = addr - region.base;
-        if offset == 0 || offset >= region.len { return Err("einval"); }
-        let second = VmRegion::new(addr, region.len - offset, region.flags);
-        self.vm_map.regions.push(second);
+        let idx = self.vm_map.regions
+            .iter()
+            .position(|region| region.contains(addr))
+            .ok_or("enomem")?;
+        let (left, right) = {
+            let region = &self.vm_map.regions[idx];
+            region.split_at(addr).ok_or("einval")?
+        };
+        self.vm_map.regions[idx] = left;
+        self.vm_map.regions.insert(idx + 1, right);
         Ok(())
     }
 }
